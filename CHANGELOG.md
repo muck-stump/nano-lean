@@ -19,6 +19,8 @@
 - Unfold oversized `Nat.pow` and `Nat.shiftLeft` as Lean does.
 - Pin Rust 1.97.1, elan 4.2.4 and olean-export 0.2.0.
 - Check Mathlib and corpora as blean in CI.
+- Upgrade olean-export to 0.3.0.
+- Replace `stacker` with a stack floor guard that declines a declaration instead of overflowing.
 
 ## 0.1.0 (2026-10-08)
 

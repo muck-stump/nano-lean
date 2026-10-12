@@ -14,6 +14,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Seek},
     path::Path,
+    thread,
 };
 
 pub const FORMAT_VERSION: &str = "3.1.0";
@@ -196,7 +197,7 @@ struct CheckPlan {
     digest: Sha256,
 }
 
-pub fn check_export(reader: impl BufRead) -> Result<ExportReport> {
+pub fn check_export(reader: impl BufRead + Send) -> Result<ExportReport> {
     #[cfg(feature = "profile")]
     let _profile = crate::profile::export();
     check_with_counts(reader, None)
@@ -231,7 +232,7 @@ pub fn check_export_file_shard(
         shard: Some((shard, workers)),
         ..Default::default()
     };
-    let report = stacker::grow(STACK_BYTES, || check::run(reader, counts, &mut plan))?;
+    let report = deep(|| check::run(reader, counts, &mut plan))?;
     Ok(ShardReport {
         shard,
         workers,
@@ -242,9 +243,22 @@ pub fn check_export_file_shard(
     })
 }
 
-fn check_with_counts(reader: impl BufRead, counts: Option<Vec<u32>>) -> Result<ExportReport> {
-    stacker::grow(STACK_BYTES, || {
-        check::run(reader, counts, &mut CheckPlan::default())
+fn check_with_counts(
+    reader: impl BufRead + Send,
+    counts: Option<Vec<u32>>,
+) -> Result<ExportReport> {
+    deep(|| check::run(reader, counts, &mut CheckPlan::default()))
+}
+
+/// Run `f` on a thread whose stack fits the reference kernel's recursion.
+fn deep<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    thread::scope(|s| {
+        thread::Builder::new()
+            .stack_size(STACK_BYTES)
+            .spawn_scoped(s, f)
+            .expect("spawn export thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
     })
 }
 

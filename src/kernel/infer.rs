@@ -56,7 +56,8 @@ impl Checker<'_> {
         if let Some(ty) = self.cache.inferred.get(&key) {
             return Ok(ty.clone());
         }
-        let ty = grow(|| self.infer_core(e, context))?;
+        self.guard()?;
+        let ty = self.infer_core(e, context)?;
         self.cache.inferred.insert(key, ty.clone());
         Ok(ty)
     }

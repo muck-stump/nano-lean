@@ -4,6 +4,7 @@ use crate::kernel::export_validation::{
     ExportDependency, ExportSession, validate_export_dependencies,
 };
 use crate::kernel::{Expr as KernelExpr, Level as KernelLevel};
+use crate::resource::{Budget, stack_exhausted, stack_floor};
 use crate::term::decl::Declar;
 use crate::term::expr::Expr;
 use crate::term::intern::{Block, Store};
@@ -23,8 +24,6 @@ use std::time::Instant;
 use unbound::prelude::{Name as KernelName, Shared, bind};
 
 const CONVERT_CACHE_LIMIT: usize = 65536;
-const STACK_RED_ZONE: usize = 128 << 10;
-const STACK_GROWTH: usize = 2 << 20;
 
 pub struct Adapter<'a> {
     store: &'a Store<'a>,
@@ -37,7 +36,7 @@ impl<'a> Adapter<'a> {
         Self {
             store,
             session: ExportSession::default(),
-            convert: Convert::default(),
+            convert: Convert::new(),
         }
     }
 }
@@ -123,11 +122,11 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                 adapter.session.validate(prefix, target, theorem, work)
             });
             if adapter.convert.expressions.len() > CONVERT_CACHE_LIMIT {
-                adapter.convert = Convert::default();
+                adapter.convert = Convert::new();
             }
             return accept(result);
         }
-        let mut convert = Convert::default();
+        let mut convert = Convert::new();
         let store = self.ctx.store;
         let prefix: Vec<_> = dependencies
             .into_iter()
@@ -258,14 +257,23 @@ fn roots<'a>(d: Declar<'a>, out: &mut Vec<ExprPtr<'a>>, target: bool) {
     }
 }
 
-#[derive(Default)]
 struct Convert<'a> {
     names: FxHashMap<NamePtr<'a>, String>,
     levels: FxHashMap<LevelPtr<'a>, KernelLevel>,
     expressions: FxHashMap<ExprPtr<'a>, Shared<KernelExpr>>,
+    floor: usize,
 }
 
 impl<'a> Convert<'a> {
+    fn new() -> Self {
+        Self {
+            names: FxHashMap::default(),
+            levels: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+            floor: stack_floor(),
+        }
+    }
+
     fn declaration(&mut self, store: &Store<'a>, d: Declar<'a>, target: bool) -> ExportDependency {
         match d {
             Declar::Ind(_) | Declar::Ctor(_) | Declar::Rec(_) => {
@@ -349,37 +357,38 @@ impl<'a> Convert<'a> {
         if let Some(v) = self.expressions.get(&e) {
             return v.clone();
         }
-        stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH, || {
-            let out = match *e {
-                Expr::Var { idx, .. } => KernelExpr::Var(KernelName::bound(usize::from(idx), 0)),
-                Expr::Sort { level, .. } => KernelExpr::Sort(self.level(level)),
-                Expr::Const { name, levels, .. } => KernelExpr::Const(
-                    self.name(name),
-                    levels.iter().map(|l| self.level(*l)).collect(),
-                ),
-                Expr::App { fun, arg, .. } => KernelExpr::App(self.expr(fun), self.expr(arg)),
-                Expr::Lam { ty, body, .. } => {
-                    KernelExpr::Lam(self.expr(ty), bind(KernelName::new("x"), self.expr(body)))
-                }
-                Expr::Pi { ty, body, .. } => {
-                    KernelExpr::Pi(self.expr(ty), bind(KernelName::new("x"), self.expr(body)))
-                }
-                Expr::Let { data, .. } => KernelExpr::Let(
-                    self.expr(data.ty),
-                    self.expr(data.val),
-                    bind(KernelName::new("x"), self.expr(data.body)),
-                ),
-                Expr::Proj { name, idx, e, .. } => {
-                    KernelExpr::Proj(self.name(name), usize::from(idx), self.expr(e))
-                }
-                Expr::NatLit { n, .. } => KernelExpr::nat(n.as_ref().clone()),
-                Expr::StrLit { s, .. } => KernelExpr::Str(s.s.into()),
-                Expr::Local { .. } => reject!("local in imported inductive declaration"),
-            };
-            let out = Shared::new(out);
-            self.expressions.insert(e, out.clone());
-            out
-        })
+        if stack_exhausted(self.floor) {
+            Budget::Stack.decline();
+        }
+        let out = match *e {
+            Expr::Var { idx, .. } => KernelExpr::Var(KernelName::bound(usize::from(idx), 0)),
+            Expr::Sort { level, .. } => KernelExpr::Sort(self.level(level)),
+            Expr::Const { name, levels, .. } => KernelExpr::Const(
+                self.name(name),
+                levels.iter().map(|l| self.level(*l)).collect(),
+            ),
+            Expr::App { fun, arg, .. } => KernelExpr::App(self.expr(fun), self.expr(arg)),
+            Expr::Lam { ty, body, .. } => {
+                KernelExpr::Lam(self.expr(ty), bind(KernelName::new("x"), self.expr(body)))
+            }
+            Expr::Pi { ty, body, .. } => {
+                KernelExpr::Pi(self.expr(ty), bind(KernelName::new("x"), self.expr(body)))
+            }
+            Expr::Let { data, .. } => KernelExpr::Let(
+                self.expr(data.ty),
+                self.expr(data.val),
+                bind(KernelName::new("x"), self.expr(data.body)),
+            ),
+            Expr::Proj { name, idx, e, .. } => {
+                KernelExpr::Proj(self.name(name), usize::from(idx), self.expr(e))
+            }
+            Expr::NatLit { n, .. } => KernelExpr::nat(n.as_ref().clone()),
+            Expr::StrLit { s, .. } => KernelExpr::Str(s.s.into()),
+            Expr::Local { .. } => reject!("local in imported inductive declaration"),
+        };
+        let out = Shared::new(out);
+        self.expressions.insert(e, out.clone());
+        out
     }
 
     fn block(&mut self, store: &Store<'a>, b: Block) -> kernel::InductiveBlock {

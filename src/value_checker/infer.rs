@@ -160,6 +160,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         only: bool,
     ) -> R<V<'t>> {
         self.tick()?;
+        self.guard();
         if let Expr::Var { idx, .. } = *e {
             let v = env
                 .get(idx)

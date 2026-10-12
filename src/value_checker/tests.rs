@@ -1,7 +1,9 @@
 use super::*;
 use crate::checker::{self, Adapter};
 use crate::import::import_bytes;
-use crate::term::outcome::{self, Failure};
+use crate::resource::Budget;
+use crate::term::outcome::{self, Decline, Failure};
+use std::fmt::Write;
 
 macro_rules! fixtures {
     ($($f:literal),*) => { [$((concat!($f), include_bytes!(concat!("../../tests/fixtures/", $f)).as_slice())),*] };
@@ -77,4 +79,57 @@ fn fixture_outcomes_match_the_term_checker() {
             assert_eq!(kind(&old), kind(&shared), "{file}: {name} in a session");
         }
     }
+}
+
+#[test]
+fn deep_term_declines_instead_of_overflowing() {
+    const DEPTH: usize = 200_000;
+    let mut s = String::from(concat!(
+        "{\"meta\":{\"format\":{\"version\":\"3.1.0\"}}}\n",
+        "{\"in\":1,\"str\":{\"pre\":0,\"str\":\"A\"}}\n",
+        "{\"in\":2,\"str\":{\"pre\":0,\"str\":\"a\"}}\n",
+        "{\"in\":3,\"str\":{\"pre\":0,\"str\":\"f\"}}\n",
+        "{\"in\":4,\"str\":{\"pre\":0,\"str\":\"d\"}}\n",
+        "{\"il\":1,\"succ\":0}\n",
+        "{\"ie\":0,\"sort\":1}\n",
+        "{\"axiom\":{\"name\":1,\"levelParams\":[],\"type\":0,\"isUnsafe\":false}}\n",
+        "{\"const\":{\"name\":1,\"us\":[]},\"ie\":1}\n",
+        "{\"axiom\":{\"name\":2,\"levelParams\":[],\"type\":1,\"isUnsafe\":false}}\n",
+        "{\"forallE\":{\"binderInfo\":\"default\",\"body\":1,\"name\":2,\"type\":1},\"ie\":2}\n",
+        "{\"axiom\":{\"name\":3,\"levelParams\":[],\"type\":2,\"isUnsafe\":false}}\n",
+        "{\"const\":{\"name\":2,\"us\":[]},\"ie\":3}\n",
+        "{\"const\":{\"name\":3,\"us\":[]},\"ie\":4}\n",
+    ));
+    for i in 0..DEPTH {
+        writeln!(
+            s,
+            "{{\"app\":{{\"arg\":{},\"fn\":4}},\"ie\":{}}}",
+            3 + i,
+            5 + i
+        )
+        .unwrap();
+    }
+    writeln!(
+        s,
+        "{{\"def\":{{\"all\":[4],\"hints\":{{\"regular\":1}},\"levelParams\":[],\"name\":4,\"safety\":\"safe\",\"type\":1,\"value\":{}}}}}",
+        4 + DEPTH
+    )
+    .unwrap();
+    outcome::install_hook();
+    std::thread::Builder::new()
+        .stack_size(4 << 20)
+        .spawn(move || {
+            let arena = Arena::new();
+            let store = import_bytes(&arena, s.as_bytes()).unwrap();
+            let mut local = Arena::new();
+            let r = check(&store, &mut local, 3, Limits::default(), None, true);
+            let reason = r.as_ref().err().map_or("accepted", Failure::reason);
+            assert!(
+                matches!(r, Err(Failure::Declined(Decline::Exhausted(Budget::Stack)))),
+                "{reason}"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

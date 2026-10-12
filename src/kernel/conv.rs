@@ -11,7 +11,8 @@ impl Checker<'_> {
         if let Some(value) = self.cache.reduced.get(&key) {
             return Ok(value.clone());
         }
-        let value = grow(|| self.whnf_core(e, unfold))?;
+        self.guard()?;
+        let value = self.whnf_core(e, unfold)?;
         self.cache.reduced.insert(key, value.clone());
         Ok(value)
     }
@@ -53,7 +54,8 @@ impl Checker<'_> {
         if let Some(result) = self.cache.equal.get(&key) {
             return Ok(*result);
         }
-        let result = grow(|| self.conv_core(a, b))?;
+        self.guard()?;
+        let result = self.conv_core(a, b)?;
         self.cache.equal.insert(key, result);
         Ok(result)
     }

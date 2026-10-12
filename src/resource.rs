@@ -2,18 +2,53 @@ use crate::kernel::Error;
 use crate::term::outcome::{Decline, raise};
 use std::fmt;
 
-const STACK_RED_ZONE: usize = 256 << 10;
-const STACK_SEGMENT: usize = 16 << 20;
+const STACK_RED_ZONE: usize = 1 << 20;
 
-#[inline]
-pub(crate) fn grow<T>(f: impl FnOnce() -> T) -> T {
-    stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, f)
+/// Lowest address the calling thread's recursion may reach before it declines.
+/// The red zone stays free for the unguarded leaves below the last guard.
+pub(crate) fn stack_floor() -> usize {
+    #[cfg(target_os = "macos")]
+    // SAFETY: both calls only read the current thread's attributes.
+    let (top, size) = unsafe {
+        let t = libc::pthread_self();
+        (
+            libc::pthread_get_stackaddr_np(t) as usize,
+            libc::pthread_get_stacksize_np(t),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: the attributes are initialized by pthread_getattr_np before being read and freed.
+    let (top, size) = unsafe {
+        let mut attr = std::mem::zeroed::<libc::pthread_attr_t>();
+        let (mut base, mut size) = (std::ptr::null_mut(), 0);
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
+            libc::pthread_attr_getstack(&attr, &mut base, &mut size);
+            libc::pthread_attr_destroy(&mut attr);
+        }
+        (base as usize + size, size)
+    };
+    top - size + STACK_RED_ZONE.min(size / 2)
+}
+
+/// Whether the caller's frame has reached `floor`.
+#[inline(always)]
+pub(crate) fn stack_exhausted(floor: usize) -> bool {
+    let sp: usize;
+    // SAFETY: reading the stack pointer touches no memory or flags.
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp < floor
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Budget {
     Work,
     Arena,
+    Stack,
     Checking,
     NestedExpansion,
     UniverseComparison,
@@ -24,6 +59,7 @@ impl Budget {
         match self {
             Self::Work => "declaration work budget exhausted",
             Self::Arena => "declaration arena budget exhausted",
+            Self::Stack => "declaration stack budget exhausted",
             Self::Checking => "checking budget exhausted",
             Self::NestedExpansion => "checking budget exhausted during nested expansion",
             Self::UniverseComparison => "universe comparison budget exhausted",

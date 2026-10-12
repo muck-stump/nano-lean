@@ -28,7 +28,7 @@ impl<'b, 'a> Evaluator<'b, 'a> {
             return Ok(value.clone());
         }
         let newly_active = self.state.active.insert(term.id);
-        let result = grow(|| self.steps(term, unfold));
+        let result = self.tc.guard().and_then(|()| self.steps(term, unfold));
         if newly_active {
             self.state.active.remove(&term.id);
         }

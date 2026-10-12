@@ -13,7 +13,7 @@ mod whnf;
 
 use crate::checker::Limits;
 use crate::checker::env::Decls;
-use crate::resource::Budget;
+use crate::resource::{Budget, stack_exhausted, stack_floor};
 #[cfg(feature = "vstats")]
 use crate::term::FxHashMap;
 use crate::term::arena::Arena;
@@ -61,6 +61,7 @@ struct Vc<'t, 'a: 't> {
     dummy: V<'t>,
     t: Tables<'t>,
     base: usize,
+    floor: usize,
     #[cfg(feature = "vstats")]
     pub stats: Stats,
     #[cfg(feature = "vstats")]
@@ -104,6 +105,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     transmute::<Tables<'static>, Tables<'t>>(t)
                 }),
             base: arena.allocated_bytes(),
+            floor: stack_floor(),
             #[cfg(feature = "vstats")]
             stats: Stats::default(),
             #[cfg(feature = "vstats")]
@@ -113,6 +115,13 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
 
     fn used(&self) -> usize {
         self.ctx.arena.allocated_bytes() - self.base
+    }
+
+    #[inline(always)]
+    fn guard(&self) {
+        if stack_exhausted(self.floor) {
+            Budget::Stack.decline();
+        }
     }
 
     fn ensure_arena(&self) {

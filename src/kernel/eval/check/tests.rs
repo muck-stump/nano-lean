@@ -54,6 +54,15 @@ fn relevance_respects_universes_and_unknown_telescope_tails() {
 }
 #[test]
 fn speculative_comparison_falls_back_without_caching_failure() {
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(speculative_comparison)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn speculative_comparison() {
     let mut env = Environment::new();
     run("axiom A : Type; axiom a : A; axiom b : A; def hold : (forall (x : A), A) := fun (x : A) => a", &mut env).unwrap();
     let mut previous = Expr::constant("a");

@@ -184,7 +184,8 @@ impl<'b, 'a> Session<'b, 'a> {
         }
     }
     fn quote_type(&mut self, ty: &Type) -> Result<Expr> {
-        grow(|| self.quote_type_core(ty))
+        self.ev.tc.guard()?;
+        self.quote_type_core(ty)
     }
     fn quote_type_core(&mut self, ty: &Type) -> Result<Expr> {
         match ty {
@@ -214,7 +215,8 @@ impl<'b, 'a> Session<'b, 'a> {
         if let Some(level) = self.sorts.get(&ty.id()) {
             return Ok(level.clone());
         }
-        let level = grow(|| self.type_sort_core(ty))?;
+        self.ev.tc.guard()?;
+        let level = self.type_sort_core(ty)?;
         self.sorts.insert(ty.id(), level.clone());
         Ok(level)
     }
@@ -247,7 +249,8 @@ impl<'b, 'a> Session<'b, 'a> {
         if !checking && let Some(ty) = self.inferred.get(&(e.id, true)) {
             return Ok(ty.clone());
         }
-        let ty = grow(|| self.infer_core(e, checking))?;
+        self.ev.tc.guard()?;
+        let ty = self.infer_core(e, checking)?;
         self.inferred.insert(key, ty.clone());
         Ok(ty)
     }

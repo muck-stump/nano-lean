@@ -11,7 +11,8 @@ impl Session<'_, '_> {
         if let Some(result) = self.equal.get(&key) {
             return Ok(*result);
         }
-        let result = grow(|| self.conv_core(a, b, types))?;
+        self.ev.tc.guard()?;
+        let result = self.conv_core(a, b, types)?;
         self.equal.insert(key, result);
         Ok(result)
     }

@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 impl<'t, 'a: 't> Vc<'t, 'a> {
     pub(crate) fn whnf_core(&mut self, v: V<'t>) -> R<V<'t>> {
         self.tick()?;
+        self.guard();
         let K::Neu(h, args) = v.k else { return Ok(v) };
         if matches!(h, Head::Local(..)) {
             return Ok(v);

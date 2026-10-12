@@ -184,6 +184,7 @@ struct Checker<'a> {
     checking: bool,
     semantic: bool,
     definitions: HashMap<Name<Expr>, Expr>,
+    floor: usize,
 }
 
 impl<'a> Checker<'a> {
@@ -201,7 +202,15 @@ impl<'a> Checker<'a> {
             checking: true,
             semantic: true,
             definitions: HashMap::default(),
+            floor: crate::resource::stack_floor(),
         }
+    }
+    #[inline(always)]
+    fn guard(&self) -> Result<()> {
+        if crate::resource::stack_exhausted(self.floor) {
+            return Err(Budget::Stack.into());
+        }
+        Ok(())
     }
     fn tick(&mut self) -> Result<()> {
         if let Some(work) = &self.env.export_work {

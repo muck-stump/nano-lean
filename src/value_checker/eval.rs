@@ -53,6 +53,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
     }
 
     fn eval_compound(&mut self, env: Env<'t>, sub: Sub<'t>, e: ExprPtr<'t>) -> R<V<'t>> {
+        self.guard();
         let closed = e.closed();
         let env = if closed { Env::EMPTY } else { env };
         let h = match if closed {

@@ -1,7 +1,6 @@
 use super::value::{Clo, Env, Head, K, V, View, key};
 use super::{R, Stop, Vc, stat};
 use crate::checker::env::{Decls, positive, strip_pis, unfold_order};
-use crate::resource::grow;
 use crate::term::decl::{Declar, Hint};
 use crate::term::expr::Expr;
 use crate::term::level::Level;
@@ -62,7 +61,8 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         if same {
             stat!(self, deq_same);
         }
-        let r = same || grow(|| self.def_eq_core(t, s))?;
+        self.guard();
+        let r = same || self.def_eq_core(t, s)?;
         if r {
             self.t.eq_cache.insert_both(key(t), key(s));
         } else if !matches!(t.k, K::Lam(..)) && !matches!(s.k, K::Lam(..)) {
