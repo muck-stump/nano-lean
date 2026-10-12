@@ -1,4 +1,5 @@
 use super::Tc;
+use crate::term::outcome::R;
 use crate::term::{expr::Expr, ptr::ExprPtr};
 use crate::{ensure, reject};
 use std::rc::Rc;
@@ -46,7 +47,7 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         e: ExprPtr<'t>,
         env: &mut Vec<ExprPtr<'t>>,
         only: bool,
-    ) -> ExprPtr<'t> {
+    ) -> R<ExprPtr<'t>> {
         if e.closed() {
             self.infer(e, only)
         } else {
@@ -59,54 +60,52 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         e: ExprPtr<'t>,
         env: &mut Vec<ExprPtr<'t>>,
         only: bool,
-    ) -> ExprPtr<'t> {
-        self.tick();
+    ) -> R<ExprPtr<'t>> {
+        self.tick()?;
         let slots = self.support(e);
-        let relevant: Vec<_> = slots
-            .iter()
-            .map(|&i| {
-                env.len()
-                    .checked_sub(usize::from(i) + 1)
-                    .map(|j| env[j])
-                    .unwrap_or_else(|| reject!("unexpected bound variable"))
-            })
-            .collect();
+        let mut relevant = Vec::with_capacity(slots.len());
+        for &i in slots.iter() {
+            let Some(j) = env.len().checked_sub(usize::from(i) + 1) else {
+                reject!(self, "unexpected bound variable")
+            };
+            relevant.push(env[j]);
+        }
         let key = (e, relevant);
         if let Some(&ty) = self.open_infer_cache[0].get(&key) {
-            return ty;
+            return Ok(ty);
         }
         if only && let Some(&ty) = self.open_infer_cache[1].get(&key) {
-            return ty;
+            return Ok(ty);
         }
         let result = match *e {
-            Expr::Var { idx, .. } => self.infer(env[env.len() - 1 - usize::from(idx)], only),
+            Expr::Var { idx, .. } => self.infer(env[env.len() - 1 - usize::from(idx)], only)?,
             Expr::App { .. } => {
                 let (head, args) = self.ctx.unfold_apps(e);
-                let mut ft = self.infer_under(head, env, only);
+                let mut ft = self.infer_under(head, env, only)?;
                 for arg in args {
-                    self.tick();
-                    ft = self.ensure_pi(ft);
+                    self.tick()?;
+                    ft = self.ensure_pi(ft)?;
                     let Expr::Pi { ty, body, .. } = *ft else {
                         unreachable!()
                     };
                     if !only {
-                        let actual = self.infer_under(arg, env, false);
-                        ensure!(self.def_eq(actual, ty), "application type mismatch");
+                        let actual = self.infer_under(arg, env, false)?;
+                        ensure!(self, self.def_eq(actual, ty)?, "application type mismatch");
                     }
                     ft = if body.closed() {
                         body
                     } else {
-                        let value = self.ctx.inst(arg, env);
-                        self.ctx.inst1(body, value)
+                        let value = self.inst(arg, env)?;
+                        self.inst1(body, value)?
                     };
                 }
                 ft
             }
             Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-                let domain = self.ctx.inst(ty, env);
+                let domain = self.inst(ty, env)?;
                 let sort = if matches!(*e, Expr::Pi { .. }) || !only {
-                    let inferred = self.infer(domain, only);
-                    Some(self.ensure_sort(inferred))
+                    let inferred = self.infer(domain, only)?;
+                    Some(self.ensure_sort(inferred)?)
                 } else {
                     None
                 };
@@ -114,10 +113,11 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                 env.push(local);
                 let result = self.infer_under(body, env, only);
                 env.pop();
+                let result = result?;
                 if matches!(*e, Expr::Pi { .. })
                     && let Some(sort) = sort
                 {
-                    let level = self.ensure_sort(result);
+                    let level = self.ensure_sort(result)?;
                     let level = self.ctx.imax(sort, level);
                     self.ctx.sort(level)
                 } else {
@@ -127,23 +127,23 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             }
             Expr::Let { data, .. } => {
                 if !only {
-                    let ty = self.ctx.inst(data.ty, env);
-                    self.check_type(ty);
-                    let actual = self.infer_under(data.val, env, false);
-                    ensure!(self.def_eq(actual, ty), "let value type mismatch");
+                    let ty = self.inst(data.ty, env)?;
+                    self.check_type(ty)?;
+                    let actual = self.infer_under(data.val, env, false)?;
+                    ensure!(self, self.def_eq(actual, ty)?, "let value type mismatch");
                 }
-                let value = self.ctx.inst(data.val, env);
+                let value = self.inst(data.val, env)?;
                 env.push(value);
                 let result = self.infer_under(data.body, env, only);
                 env.pop();
-                result
+                result?
             }
             _ => {
-                let closed = self.ctx.inst(e, env);
-                self.infer(closed, only)
+                let closed = self.inst(e, env)?;
+                self.infer(closed, only)?
             }
         };
         self.open_infer_cache[usize::from(only)].insert(key, result);
-        result
+        Ok(result)
     }
 }

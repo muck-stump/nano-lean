@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 impl<'t, 'a: 't> Vc<'t, 'a> {
     pub(crate) fn whnf_core(&mut self, v: V<'t>) -> R<V<'t>> {
         self.tick()?;
-        self.guard();
+        self.guard()?;
         let K::Neu(h, args) = v.k else { return Ok(v) };
         if matches!(h, Head::Local(..)) {
             return Ok(v);
@@ -273,9 +273,9 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
 
     pub(crate) fn nat_to_ctor(&mut self, n: &'t BigUint) -> R<V<'t>> {
         if n.is_zero() {
-            return Ok(self.konst0(self.names.nat_zero));
+            return self.konst0(self.names.nat_zero);
         }
-        let s = self.konst0(self.names.nat_succ);
+        let s = self.konst0(self.names.nat_succ)?;
         let p = self.nat(n - 1u32);
         self.apply(s, &[p])
     }
@@ -297,10 +297,10 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
     pub(crate) fn str_to_ctor(&mut self, s: &'t str) -> R<V<'t>> {
         let z = self.ctx.zero();
         let l0 = self.ctx.levels(&[z]);
-        let ch = self.konst0(self.names.char);
-        let of_nat = self.konst0(self.names.char_of_nat);
+        let ch = self.konst0(self.names.char)?;
+        let of_nat = self.konst0(self.names.char_of_nat)?;
         let (Some(nil), Some(cons)) = (self.names.list_nil, self.names.list_cons) else {
-            reject!("missing builtin constant")
+            reject!(self, "missing builtin constant")
         };
         let nil = self.mk(K::Neu(Head::Const(nil, l0), &[]), false);
         let cons = self.mk(K::Neu(Head::Const(cons, l0), &[]), false);
@@ -310,7 +310,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             let x = self.apply(of_nat, &[n])?;
             out = self.apply(cons, &[ch, x, out])?;
         }
-        let f = self.konst0(self.names.string_of_list);
+        let f = self.konst0(self.names.string_of_list)?;
         self.apply(f, &[out])
     }
 
@@ -364,8 +364,8 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         };
         Ok(Some(match r {
             NatValue::Nat(r) => self.nat(r),
-            NatValue::Bool(true) => self.konst0(self.names.bool_true),
-            NatValue::Bool(false) => self.konst0(self.names.bool_false),
+            NatValue::Bool(true) => self.konst0(self.names.bool_true)?,
+            NatValue::Bool(false) => self.konst0(self.names.bool_false)?,
         }))
     }
 }

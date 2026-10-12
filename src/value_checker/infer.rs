@@ -13,7 +13,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         }
         match self.whnf(t)?.k {
             K::Sort(l) => Ok(l),
-            _ => reject!("expected a sort"),
+            _ => reject!(self, "expected a sort"),
         }
     }
 
@@ -23,7 +23,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         }
         match self.whnf(t)?.k {
             K::Pi(d, c) => Ok((d, c)),
-            _ => reject!("expected a function type"),
+            _ => reject!(self, "expected a function type"),
         }
     }
 
@@ -33,19 +33,19 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         Ok(match s.k {
             K::Sort(l) => {
                 let z = self.ctx.zero();
-                self.ctx.level_eq(l, z)
+                self.level_eq(l, z)?
             }
             _ => false,
         })
     }
 
     fn literal_type(&mut self, n: Option<NamePtr<'t>>) -> R<V<'t>> {
-        let ty = self.konst0(n);
+        let ty = self.konst0(n)?;
         let s = self.type_of(ty)?;
         let z = self.ctx.zero();
         let one = self.ctx.succ(z);
         let expected = self.mk(K::Sort(one), false);
-        ensure!(self.def_eq(s, expected)?, "invalid literal type");
+        ensure!(self, self.def_eq(s, expected)?, "invalid literal type");
         Ok(ty)
     }
 
@@ -99,29 +99,30 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         let is_prop = self.is_prop(st)?;
         let st = self.whnf(st)?;
         let K::Neu(Head::Const(iname, ls), args) = st.k else {
-            reject!("projection of a non-structure")
+            reject!(self, "projection of a non-structure")
         };
-        ensure!(iname == name, "projection type mismatch");
+        ensure!(self, iname == name, "projection type mismatch");
         let Some((ind, ctor)) = self.single_ctor(name) else {
-            reject!("projection of a non-structure")
+            reject!(self, "projection of a non-structure")
         };
         ensure!(
+            self,
             args.len() == usize::from(ind.num_params),
             "projection of a non-structure"
         );
         let mut r = self.const_type(ctor.info.name, ls)?;
         for &a in args {
             let K::Pi(_, c) = r.k else {
-                reject!("expected a function type")
+                reject!(self, "expected a function type")
             };
             r = self.inst(c, a)?;
         }
         for i in 0..idx {
             let K::Pi(d, c) = self.whnf(r)?.k else {
-                reject!("invalid projection")
+                reject!(self, "invalid projection")
             };
             if self.uses_arg(c) {
-                ensure!(!is_prop || self.is_prop(d)?, "invalid projection");
+                ensure!(self, !is_prop || self.is_prop(d)?, "invalid projection");
                 let p = self.proj(name, i, s);
                 r = self.inst(c, p)?;
             } else {
@@ -130,9 +131,9 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             }
         }
         let K::Pi(d, _) = self.whnf(r)?.k else {
-            reject!("invalid projection")
+            reject!(self, "invalid projection")
         };
-        ensure!(!is_prop || self.is_prop(d)?, "invalid projection");
+        ensure!(self, !is_prop || self.is_prop(d)?, "invalid projection");
         Ok(d)
     }
 
@@ -160,11 +161,11 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         only: bool,
     ) -> R<V<'t>> {
         self.tick()?;
-        self.guard();
+        self.guard()?;
         if let Expr::Var { idx, .. } = *e {
-            let v = env
-                .get(idx)
-                .unwrap_or_else(|| reject!("unexpected bound variable"));
+            let Some(v) = env.get(idx) else {
+                reject!(self, "unexpected bound variable")
+            };
             return match v.k {
                 K::Neu(Head::Local(_, ty), []) => Ok(ty),
                 _ => self.type_of(v),
@@ -197,7 +198,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         let env = if closed {
             Env::EMPTY
         } else if matches!(*e, Expr::Lam { .. } | Expr::Pi { .. } | Expr::Let { .. }) {
-            self.trim(env, e)
+            self.trim(env, e)?
         } else {
             env
         };
@@ -218,15 +219,15 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         }
         let t = match *e {
             Expr::Var { idx, .. } => {
-                let v = env
-                    .get(idx)
-                    .unwrap_or_else(|| reject!("unexpected bound variable"));
+                let Some(v) = env.get(idx) else {
+                    reject!(self, "unexpected bound variable")
+                };
                 self.type_of(v)?
             }
-            Expr::Local { .. } => reject!("unexpected local in syntax"),
+            Expr::Local { .. } => reject!(self, "unexpected local in syntax"),
             Expr::Sort { level, .. } => {
                 if !only {
-                    self.check_level(level);
+                    self.check_level(level)?;
                 }
                 let l = self.subst_level(sub, level);
                 let l = self.ctx.succ(l);
@@ -234,16 +235,17 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             }
             Expr::Const { name, levels, .. } => {
                 let Some(d) = self.declar(name) else {
-                    reject!("unknown constant {}", name.as_ref())
+                    reject!(self, "unknown constant {}", name.as_ref())
                 };
                 ensure!(
+                    self,
                     levels.len() == d.uparams().len(),
                     "wrong number of universe levels for {}",
                     name.as_ref()
                 );
                 if !only {
                     for &l in levels.as_ref() {
-                        self.check_level(l);
+                        self.check_level(l)?;
                     }
                 }
                 let ls = self.ctx.subst_levels(levels, sub.ks, sub.vs);
@@ -262,7 +264,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     let (d, c) = self.ensure_pi(ft)?;
                     if !only {
                         let at = self.infer(env, sub, a, false)?;
-                        ensure!(self.def_eq(at, d)?, "application type mismatch");
+                        ensure!(self, self.def_eq(at, d)?, "application type mismatch");
                     }
                     let x = if self.uses_arg(c) {
                         self.eval(env, sub, a)?
@@ -308,7 +310,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     self.ensure_sort(s)?;
                     let tv = self.eval(env, sub, data.ty)?;
                     let at = self.infer(env, sub, data.val, false)?;
-                    ensure!(self.def_eq(at, tv)?, "let value type mismatch");
+                    ensure!(self, self.def_eq(at, tv)?, "let value type mismatch");
                 }
                 let v = self.eval(env, sub, data.val)?;
                 let env1 = self.push(env, v);

@@ -1,12 +1,25 @@
-//! Checking failures unwind as panics with a `Reject` or `Decline` payload. Others are internal
-//! errors. This is a performance decision: failure is rare and fatal to the declaration, so
-//! unwinding keeps every evaluation and conversion step free of a `Result` branch.
+//! Both checkers record their failure and return through the `R` chain, so nothing panics or
+//! unwinds on a rejection or a decline.
 
 use crate::resource::Budget;
-use std::any::Any;
-use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 
-pub struct Reject(pub String);
+/// Unwinds the `R` chain, never a semantic answer. A probe ran out when the checker's `fail`
+/// slot is empty. Zero sized so `R<V>` keeps the pointer niche.
+#[derive(Debug)]
+pub struct Stop;
+pub type R<T> = Result<T, Stop>;
+
+const PROBE_ESCAPED: &str = "probe exhaustion escaped its probe";
+
+#[macro_export]
+macro_rules! reject {
+    ($s:expr, $($a:tt)+) => { return ::std::result::Result::Err($s.reject(::std::format_args!($($a)+))) };
+}
+
+#[macro_export]
+macro_rules! ensure {
+    ($s:expr, $c:expr, $($a:tt)+) => { if !$c { $crate::reject!($s, $($a)+) } };
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Decline {
@@ -14,31 +27,6 @@ pub enum Decline {
     Exhausted(Budget),
     #[error("{0}")]
     Unsupported(String),
-}
-
-pub(crate) struct ProbeExhausted;
-
-#[cold]
-#[inline(never)]
-#[allow(clippy::panic)]
-pub fn raise<P: Any + Send>(payload: P) -> ! {
-    panic_any(payload)
-}
-
-#[macro_export]
-macro_rules! reject {
-    ($($a:tt)+) => { $crate::term::outcome::raise($crate::term::outcome::Reject(::std::format!($($a)+))) };
-}
-
-#[macro_export]
-macro_rules! unsupported {
-    ($($a:tt)+) => { $crate::term::outcome::raise($crate::term::outcome::Decline::Unsupported(::std::format!($($a)+))) };
-}
-
-#[macro_export]
-macro_rules! ensure {
-    ($c:expr $(,)?) => { if !$c { $crate::reject!("check failed: {}", stringify!($c)) } };
-    ($c:expr, $($a:tt)+) => { if !$c { $crate::reject!($($a)+) } };
 }
 
 pub enum Failure {
@@ -71,32 +59,9 @@ impl Failure {
         }
     }
 
-    pub fn from_panic(p: Box<dyn Any + Send>) -> Self {
-        match p.downcast::<Reject>() {
-            Ok(r) => Failure::Rejected(r.0),
-            Err(p) => match p.downcast::<Decline>() {
-                Ok(d) => Failure::Declined(*d),
-                Err(p) => Failure::Internal(
-                    p.downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                        .unwrap_or_else(|| "unknown panic".to_owned()),
-                ),
-            },
-        }
+    /// The failure behind a `Stop` that reached the top of a check.
+    pub(crate) fn escaped(slot: &mut Option<Failure>) -> Failure {
+        slot.take()
+            .unwrap_or_else(|| Failure::Internal(PROBE_ESCAPED.to_owned()))
     }
-}
-
-pub fn run<T>(f: impl FnOnce() -> T) -> Result<T, Failure> {
-    catch_unwind(AssertUnwindSafe(f)).map_err(Failure::from_panic)
-}
-
-pub fn install_hook() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let p = info.payload();
-        if !p.is::<Reject>() && !p.is::<Decline>() && !p.is::<ProbeExhausted>() {
-            prev(info);
-        }
-    }));
 }

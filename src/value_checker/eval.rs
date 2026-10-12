@@ -45,15 +45,16 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
     #[inline(always)]
     pub(crate) fn eval(&mut self, env: Env<'t>, sub: Sub<'t>, e: ExprPtr<'t>) -> R<V<'t>> {
         if let Expr::Var { idx, .. } = *e {
-            return Ok(env
-                .get(idx)
-                .unwrap_or_else(|| reject!("unexpected bound variable")));
+            return match env.get(idx) {
+                Some(v) => Ok(v),
+                None => Err(self.reject(format_args!("unexpected bound variable"))),
+            };
         }
         self.eval_compound(env, sub, e)
     }
 
     fn eval_compound(&mut self, env: Env<'t>, sub: Sub<'t>, e: ExprPtr<'t>) -> R<V<'t>> {
-        self.guard();
+        self.guard()?;
         let closed = e.closed();
         let env = if closed { Env::EMPTY } else { env };
         let h = match if closed {
@@ -76,11 +77,12 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             Expr::Let { .. } => self.stats.ev_let += 1,
             _ => self.stats.ev_other += 1,
         }
-        self.work();
+        self.tick()?;
         let v = match *e {
-            Expr::Var { idx, .. } => env
-                .get(idx)
-                .unwrap_or_else(|| reject!("unexpected bound variable")),
+            Expr::Var { idx, .. } => match env.get(idx) {
+                Some(v) => v,
+                None => reject!(self, "unexpected bound variable"),
+            },
             Expr::Sort { level, .. } => {
                 let l = self.subst_level(sub, level);
                 self.mk(K::Sort(l), false)
@@ -117,7 +119,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                 }
             }
             Expr::Lam { ty, body, .. } => {
-                let env = self.trim(env, e);
+                let env = self.trim(env, e)?;
                 let dom = match self.t.lazies[usize::from(env.open())].get(&(env.key(), sub, ty)) {
                     Some(&d) => d,
                     None => {
@@ -145,7 +147,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                 )
             }
             Expr::Pi { ty, body, .. } => {
-                let env = self.trim(env, e);
+                let env = self.trim(env, e)?;
                 let d = self.eval(env, sub, ty)?;
                 self.mk(
                     K::Pi(
@@ -173,7 +175,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             }
             Expr::NatLit { n, .. } => self.mk(K::Nat(n.as_ref()), false),
             Expr::StrLit { s, .. } => self.mk(K::Str(s.as_ref().s), false),
-            Expr::Local { .. } => reject!("unexpected local in syntax"),
+            Expr::Local { .. } => reject!(self, "unexpected local in syntax"),
         };
         // Evaluation never revisits its own key, so the probe's hash still fits.
         if closed {
@@ -185,15 +187,15 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
     }
 
     /// Keep only the slots `e` reads, so closures equal up to unused captures share one value.
-    pub(crate) fn trim(&mut self, env: Env<'t>, e: ExprPtr<'t>) -> Env<'t> {
+    pub(crate) fn trim(&mut self, env: Env<'t>, e: ExprPtr<'t>) -> R<Env<'t>> {
         stat!(self, trims);
         let sup = self.slots(e);
         let Some((max, len)) = sup.bounds() else {
-            return Env::EMPTY;
+            return Ok(Env::EMPTY);
         };
         let n = usize::from(max) + 1;
         if len == n && env.size() == n && env.depth() <= SHALLOW {
-            return env;
+            return Ok(env);
         }
         let mask = match sup {
             Slots::Mask(m) => m,
@@ -202,7 +204,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         if mask != 0
             && let Some(r) = env.pruned(mask)
         {
-            return r;
+            return Ok(r);
         }
         let mut buf = SmallVec::<[V<'t>; 32]>::from_elem(self.dummy, n);
         let mut it = sup.peekable();
@@ -223,18 +225,18 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     for j in it.by_ref() {
                         match f.vals.get(usize::from(j - at)) {
                             Some(&v) => buf[usize::from(j)] = v,
-                            None => reject!("unexpected bound variable"),
+                            None => reject!(self, "unexpected bound variable"),
                         }
                     }
                 }
             }
         }
-        ensure!(it.peek().is_none(), "unexpected bound variable");
+        ensure!(self, it.peek().is_none(), "unexpected bound variable");
         let r = self.frame(&buf);
         if mask != 0 {
             env.set_pruned(mask, r);
         }
-        r
+        Ok(r)
     }
 
     fn frame(&mut self, vals: &[V<'t>]) -> Env<'t> {
@@ -328,7 +330,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     let open = f.open || rest.iter().any(|a| a.open);
                     return Ok(self.neu(h, sp, rest, open));
                 }
-                _ => reject!("expected a function"),
+                _ => reject!(self, "expected a function"),
             }
         }
         Ok(f)
@@ -389,7 +391,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             return Ok(v);
         }
         let Some(d) = self.declar(n) else {
-            reject!("unknown constant {}", n.as_ref())
+            reject!(self, "unknown constant {}", n.as_ref())
         };
         let v = self.eval_at(d.uparams(), ls, d.ty())?;
         self.t.const_ty.insert((n, ls), v);

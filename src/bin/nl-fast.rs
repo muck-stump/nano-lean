@@ -4,7 +4,7 @@ use libmimalloc_sys::{mi_collect, mi_option_set, mi_option_t};
 use nano_lean::checker::{Adapter, Limits};
 use nano_lean::export::ExportError;
 use nano_lean::import::{self, blean};
-use nano_lean::term::{arena::Arena, intern::Store, outcome};
+use nano_lean::term::{arena::Arena, intern::Store};
 use nano_lean::value_checker::{self, Session};
 use nano_lean::verdict::Core;
 use std::collections::HashSet;
@@ -185,7 +185,6 @@ fn main() {
         eprintln!("requested declaration not found");
         process::exit(2);
     }
-    outcome::install_hook();
     let code = check(&o, &store, &indices);
     if code != 0 {
         process::exit(code as i32);

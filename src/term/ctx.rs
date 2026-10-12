@@ -17,6 +17,8 @@ pub struct Ctx<'t, 'a: 't> {
     pub(crate) inst_cache: FxHashMap<(ExprPtr<'t>, ExprPtr<'t>), ExprPtr<'t>>,
     pub(crate) subst_cache: FxHashMap<(ExprPtr<'t>, LevelsPtr<'t>, LevelsPtr<'t>), ExprPtr<'t>>,
     pub(crate) simp_cache: FxHashMap<LevelPtr<'t>, LevelPtr<'t>>,
+    /// Set by a lift whose variable index would exceed the binder limit.
+    pub(crate) overflow: bool,
 }
 
 impl<'t, 'a: 't> Ctx<'t, 'a> {
@@ -30,6 +32,7 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
             inst_cache: FxHashMap::default(),
             subst_cache: FxHashMap::default(),
             simp_cache: FxHashMap::default(),
+            overflow: false,
         }
     }
 

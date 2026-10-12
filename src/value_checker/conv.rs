@@ -61,7 +61,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         if same {
             stat!(self, deq_same);
         }
-        self.guard();
+        self.guard()?;
         let r = same || self.def_eq_core(t, s)?;
         if r {
             self.t.eq_cache.insert_both(key(t), key(s));
@@ -143,7 +143,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         }
         Ok(match (t.k, s.k) {
             (K::Lam(..), K::Lam(..)) | (K::Pi(..), K::Pi(..)) => Some(self.def_eq_binding(t, s)?),
-            (K::Sort(a), K::Sort(b)) => Some(self.ctx.level_eq(a, b)),
+            (K::Sort(a), K::Sort(b)) => Some(self.level_eq(a, b)?),
             (K::Nat(a), K::Nat(b)) => Some(a == b),
             (K::Str(a), K::Str(b)) => Some(a == b),
             _ => None,
@@ -227,7 +227,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             && !ta.is_empty()
             && self.delta_hint(t).is_some()
             && a == b
-            && self.ctx.levels_eq(la, lb)
+            && self.levels_eq(la, lb)?
             && self.probe_args(t, s)?
         {
             return Ok(true);
@@ -250,7 +250,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         };
         match (tn.k, sn.k) {
             (K::Neu(Head::Const(a, la), []), K::Neu(Head::Const(b, lb), [])) => {
-                if a == b && self.ctx.levels_eq(la, lb) {
+                if a == b && self.levels_eq(la, lb)? {
                     return Ok(true);
                 }
             }
@@ -340,6 +340,9 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         }
         self.probe_remaining = None;
         if r.is_err() {
+            if self.fail.is_some() {
+                return Err(Stop);
+            }
             stat!(self, exhausted);
         }
         let equal = r.unwrap_or(false);
@@ -489,7 +492,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                             && !sa.is_empty()
                             && matches!(ht, Hint::Regular(_))
                             && a == b
-                            && self.ctx.levels_eq(la, lb)
+                            && self.levels_eq(la, lb)?
                             && self.probe_args(t, s)?
                         {
                             return Ok(Ok(true));
@@ -508,7 +511,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
     fn heads_eq(&mut self, a: Head<'t>, b: Head<'t>) -> R<bool> {
         Ok(match (a, b) {
             (Head::Local(x, _), Head::Local(y, _)) => x == y,
-            (Head::Const(x, lx), Head::Const(y, ly)) => x == y && self.ctx.levels_eq(lx, ly),
+            (Head::Const(x, lx), Head::Const(y, ly)) => x == y && self.levels_eq(lx, ly)?,
             (Head::Proj(_, i, x), Head::Proj(_, j, y)) => i == j && self.def_eq(x, y)?,
             _ => false,
         })

@@ -5,34 +5,36 @@ use crate::reject;
 use crate::term::decl::{Hint, Recursor};
 use crate::term::expr::Expr;
 use crate::term::names::{QUOT_FN, QUOT_MK_ARITY};
+use crate::term::outcome::R;
 use crate::term::ptr::{BigUintPtr, ExprPtr, LevelsPtr, NamePtr, StringPtr};
 use num_bigint::BigUint;
 use num_traits::Zero;
 
 impl<'t, 'a: 't> Tc<'t, 'a> {
-    pub fn whnf_core(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
-        self.tick();
+    pub fn whnf_core(&mut self, e: ExprPtr<'t>) -> R<ExprPtr<'t>> {
+        self.tick()?;
         if !matches!(*e, Expr::App { .. } | Expr::Let { .. } | Expr::Proj { .. }) {
-            return e;
+            return Ok(e);
         }
         if let Some(&r) = self.whnf_core_cache.get(&e) {
-            return r;
+            return Ok(r);
         }
         let r = match *e {
             Expr::Let { .. } => {
                 let mut values = Vec::new();
                 let mut body = e;
                 while let Expr::Let { data, .. } = *body {
-                    self.tick();
-                    values.push(self.ctx.inst(data.val, &values));
+                    self.tick()?;
+                    let value = self.inst(data.val, &values)?;
+                    values.push(value);
                     body = data.body;
                 }
-                let body = self.ctx.inst(body, &values);
-                self.whnf_core(body)
+                let body = self.inst(body, &values)?;
+                self.whnf_core(body)?
             }
             Expr::App { .. } => {
                 let (f0, args) = self.ctx.unfold_apps(e);
-                let f = self.whnf_core(f0);
+                let f = self.whnf_core(f0)?;
                 if f.is_lambda() {
                     let mut m = 0;
                     let mut b = f;
@@ -42,36 +44,40 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                         b = body;
                         m += 1;
                     }
-                    let b = self.reduce_binders(b, args[..m].to_vec());
+                    let b = self.reduce_binders(b, args[..m].to_vec())?;
                     let r = self.ctx.apps(b, &args[m..]);
-                    self.whnf_core(r)
+                    self.whnf_core(r)?
                 } else if f == f0 {
-                    match self.reduce_rec(f, &args) {
-                        Some(r) => self.whnf_core(r),
+                    match self.reduce_rec(f, &args)? {
+                        Some(r) => self.whnf_core(r)?,
                         None => e,
                     }
                 } else {
                     let r = self.ctx.apps(f, &args);
-                    self.whnf_core(r)
+                    self.whnf_core(r)?
                 }
             }
-            Expr::Proj { idx, e: s, .. } => match self.reduce_proj(idx, s) {
-                Some(r) => self.whnf_core(r),
+            Expr::Proj { idx, e: s, .. } => match self.reduce_proj(idx, s)? {
+                Some(r) => self.whnf_core(r)?,
                 None => e,
             },
             _ => unreachable!(),
         };
         self.whnf_core_cache.insert(e, r);
-        r
+        Ok(r)
     }
 
     /// Keeps substitutions outside the body across beta and let until syntax is needed.
-    fn reduce_binders(&mut self, mut body: ExprPtr<'t>, mut env: Vec<ExprPtr<'t>>) -> ExprPtr<'t> {
+    fn reduce_binders(
+        &mut self,
+        mut body: ExprPtr<'t>,
+        mut env: Vec<ExprPtr<'t>>,
+    ) -> R<ExprPtr<'t>> {
         loop {
-            self.tick();
+            self.tick()?;
             match *body {
                 Expr::Let { data, .. } => {
-                    let value = self.ctx.inst(data.val, &env);
+                    let value = self.inst(data.val, &env)?;
                     env.push(value);
                     body = data.body;
                 }
@@ -83,7 +89,7 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                         let Expr::Lam { body: next, .. } = *head else {
                             break;
                         };
-                        values.push(self.ctx.inst(args[consumed], &env));
+                        values.push(self.inst(args[consumed], &env)?);
                         consumed += 1;
                         head = next;
                     }
@@ -91,15 +97,15 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                         env.extend(values);
                         body = head;
                     } else {
-                        return self.ctx.inst(body, &env);
+                        return self.inst(body, &env);
                     }
                 }
-                _ => return self.ctx.inst(body, &env),
+                _ => return self.inst(body, &env),
             }
         }
     }
 
-    pub fn whnf(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
+    pub fn whnf(&mut self, e: ExprPtr<'t>) -> R<ExprPtr<'t>> {
         if matches!(
             *e,
             Expr::Var { .. }
@@ -110,21 +116,21 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                 | Expr::StrLit { .. }
                 | Expr::Local { .. }
         ) {
-            return e;
+            return Ok(e);
         }
         if let Some(&r) = self.whnf_cache.get(&e) {
-            return r;
+            return Ok(r);
         }
         let mut t = e;
         let mut path = Vec::new();
         let r = loop {
-            self.tick();
+            self.tick()?;
             if let Some(&r) = self.whnf_cache.get(&t) {
                 break r;
             }
             path.push(t);
-            let t1 = self.whnf_core(t);
-            if let Some(v) = self.reduce_nat(t1) {
+            let t1 = self.whnf_core(t)?;
+            if let Some(v) = self.reduce_nat(t1)? {
                 break v;
             }
             match self.unfold(t1) {
@@ -135,7 +141,7 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         for node in path {
             self.whnf_cache.insert(node, r);
         }
-        r
+        Ok(r)
     }
 
     pub(crate) fn delta_hint(&self, e: ExprPtr<'t>) -> Option<Hint> {
@@ -172,43 +178,51 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         Some(self.ctx.apps(v, &args))
     }
 
-    fn reduce_proj(&mut self, idx: u16, s: ExprPtr<'t>) -> Option<ExprPtr<'t>> {
+    fn reduce_proj(&mut self, idx: u16, s: ExprPtr<'t>) -> R<Option<ExprPtr<'t>>> {
         // Exposing the structure here stops conversion unfolding its visible twin too early.
-        let mut c = self.whnf(s);
+        let mut c = self.whnf(s)?;
         if let Expr::StrLit { s, .. } = *c {
-            let x = self.str_to_ctor(s);
-            c = self.whnf(x);
+            let x = self.str_to_ctor(s)?;
+            c = self.whnf(x)?;
         }
         let Expr::Const { name, .. } = *c.head() else {
-            return None;
+            return Ok(None);
         };
-        let k = self.ctor(name)?;
+        let Some(k) = self.ctor(name) else {
+            return Ok(None);
+        };
         let (_, args) = self.ctx.unfold_apps(c);
-        args.get(usize::from(k.num_params) + usize::from(idx))
-            .copied()
+        Ok(args
+            .get(usize::from(k.num_params) + usize::from(idx))
+            .copied())
     }
 
-    fn reduce_rec(&mut self, f: ExprPtr<'t>, args: &[ExprPtr<'t>]) -> Option<ExprPtr<'t>> {
+    fn reduce_rec(&mut self, f: ExprPtr<'t>, args: &[ExprPtr<'t>]) -> R<Option<ExprPtr<'t>>> {
         let Expr::Const { name, levels, .. } = *f else {
-            return None;
+            return Ok(None);
         };
         if let Some(mk_pos) = self.quot_major(name) {
             return self.reduce_quot(args, mk_pos);
         }
-        let r = self.recursor(name)?;
+        let Some(r) = self.recursor(name) else {
+            return Ok(None);
+        };
         self.reduce_ind_rec(r, levels, args)
     }
 
-    fn reduce_quot(&mut self, args: &[ExprPtr<'t>], mk_pos: usize) -> Option<ExprPtr<'t>> {
-        let mk = self.whnf(*args.get(mk_pos)?);
+    fn reduce_quot(&mut self, args: &[ExprPtr<'t>], mk_pos: usize) -> R<Option<ExprPtr<'t>>> {
+        let Some(&major) = args.get(mk_pos) else {
+            return Ok(None);
+        };
+        let mk = self.whnf(major)?;
         let Expr::App { arg, .. } = *mk else {
-            return None;
+            return Ok(None);
         };
         if mk.num_args() != QUOT_MK_ARITY || mk.head().const_name() != self.names.quot_mk {
-            return None;
+            return Ok(None);
         }
         let r = self.ctx.app(args[QUOT_FN], arg);
-        Some(self.ctx.apps(r, &args[mk_pos + 1..]))
+        Ok(Some(self.ctx.apps(r, &args[mk_pos + 1..])))
     }
 
     fn reduce_ind_rec(
@@ -216,39 +230,44 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         rec: Recursor<'t>,
         levels: LevelsPtr<'t>,
         args: &[ExprPtr<'t>],
-    ) -> Option<ExprPtr<'t>> {
+    ) -> R<Option<ExprPtr<'t>>> {
         let mi = rec.major_idx();
-        let mut major = *args.get(mi)?;
+        let Some(&major) = args.get(mi) else {
+            return Ok(None);
+        };
+        let mut major = major;
         if rec.is_k {
-            major = self.expose_ctor_when_k(&rec, major);
+            major = self.expose_ctor_when_k(&rec, major)?;
         }
-        major = self.whnf(major);
+        major = self.whnf(major)?;
         match *major {
-            Expr::NatLit { n, .. } => major = self.nat_to_ctor(n),
+            Expr::NatLit { n, .. } => major = self.nat_to_ctor(n)?,
             Expr::StrLit { s, .. } => {
-                let x = self.str_to_ctor(s);
-                major = self.whnf(x);
+                let x = self.str_to_ctor(s)?;
+                major = self.whnf(x)?;
             }
             _ => {
                 if let Some(ind) = self.rec_induct(&rec) {
-                    major = self.expose_ctor_when_structure(ind, major);
+                    major = self.expose_ctor_when_structure(ind, major)?;
                 }
             }
         }
         let Expr::Const { name: cname, .. } = *major.head() else {
-            return None;
+            return Ok(None);
         };
         let mut canonical = args.to_vec();
         canonical[mi] = major;
         let key = (rec.info.name, levels, canonical);
         if let Some(&result) = self.rec_cache.get(&key) {
-            return Some(result);
+            return Ok(Some(result));
         }
-        let rule = rec.rules.iter().find(|r| r.ctor == cname)?;
+        let Some(rule) = rec.rules.iter().find(|r| r.ctor == cname) else {
+            return Ok(None);
+        };
         let (_, margs) = self.ctx.unfold_apps(major);
         let nf = usize::from(rule.nfields);
         if margs.len() < nf || levels.len() != rec.info.uparams.len() {
-            return None;
+            return Ok(None);
         }
         let rhs = self
             .ctx
@@ -260,55 +279,55 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         let rhs = self.ctx.apps(rhs, &margs[margs.len() - nf..]);
         let result = self.ctx.apps(rhs, &args[mi + 1..]);
         self.rec_cache.insert(key, result);
-        Some(result)
+        Ok(Some(result))
     }
 
-    fn expose_ctor_when_k(&mut self, rec: &Recursor<'t>, e: ExprPtr<'t>) -> ExprPtr<'t> {
+    fn expose_ctor_when_k(&mut self, rec: &Recursor<'t>, e: ExprPtr<'t>) -> R<ExprPtr<'t>> {
         let Some(ind) = self.rec_induct(rec) else {
-            return e;
+            return Ok(e);
         };
-        let t = self.infer(e, true);
-        let t = self.whnf(t);
+        let t = self.infer(e, true)?;
+        let t = self.whnf(t)?;
         let Expr::Const { name, levels, .. } = *t.head() else {
-            return e;
+            return Ok(e);
         };
         if name != ind {
-            return e;
+            return Ok(e);
         }
         let (_, targs) = self.ctx.unfold_apps(t);
         let np = usize::from(rec.num_params);
         if targs.len() < np {
-            return e;
+            return Ok(e);
         }
         let c = self.ctx.konst(rec.rules[0].ctor, levels);
         let nc = self.ctx.apps(c, &targs[..np]);
-        let nt = self.infer(nc, true);
-        if self.def_eq(t, nt) { nc } else { e }
+        let nt = self.infer(nc, true)?;
+        Ok(if self.def_eq(t, nt)? { nc } else { e })
     }
 
     pub(crate) fn expose_ctor_when_structure(
         &mut self,
         ind: NamePtr<'t>,
         e: ExprPtr<'t>,
-    ) -> ExprPtr<'t> {
+    ) -> R<ExprPtr<'t>> {
         let Some((i, c)) = self.structure_like(ind) else {
-            return e;
+            return Ok(e);
         };
         if let Expr::Const { name, .. } = *e.head()
             && self.ctor(name).is_some()
         {
-            return e;
+            return Ok(e);
         }
-        let t = self.infer(e, true);
-        let t = self.whnf(t);
+        let t = self.infer(e, true)?;
+        let t = self.whnf(t)?;
         let Expr::Const { name, levels, .. } = *t.head() else {
-            return e;
+            return Ok(e);
         };
         if name != ind {
-            return e;
+            return Ok(e);
         }
-        if self.is_prop(t) {
-            return e;
+        if self.is_prop(t)? {
+            return Ok(e);
         }
         let (_, targs) = self.ctx.unfold_apps(t);
         let k = self.ctx.konst(c.info.name, levels);
@@ -319,25 +338,25 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             let p = self.ctx.proj(ind, f, e);
             r = self.ctx.app(r, p);
         }
-        r
+        Ok(r)
     }
 
-    pub(crate) fn nat_to_ctor(&mut self, n: BigUintPtr<'t>) -> ExprPtr<'t> {
+    pub(crate) fn nat_to_ctor(&mut self, n: BigUintPtr<'t>) -> R<ExprPtr<'t>> {
         if n.is_zero() {
             return self.konst0(self.names.nat_zero);
         }
-        let s = self.konst0(self.names.nat_succ);
+        let s = self.konst0(self.names.nat_succ)?;
         let p = self.ctx.nat_lit(n.as_ref() - 1u32);
-        self.ctx.app(s, p)
+        Ok(self.ctx.app(s, p))
     }
 
-    pub(crate) fn str_to_ctor(&mut self, s: StringPtr<'t>) -> ExprPtr<'t> {
+    pub(crate) fn str_to_ctor(&mut self, s: StringPtr<'t>) -> R<ExprPtr<'t>> {
         let z = self.ctx.zero();
         let l0 = self.ctx.levels(&[z]);
-        let ch = self.konst0(self.names.char);
-        let of_nat = self.konst0(self.names.char_of_nat);
+        let ch = self.konst0(self.names.char)?;
+        let of_nat = self.konst0(self.names.char_of_nat)?;
         let (Some(nil), Some(cons)) = (self.names.list_nil, self.names.list_cons) else {
-            reject!("missing builtin constant")
+            reject!(self, "missing builtin constant")
         };
         let nil = self.ctx.konst(nil, l0);
         let cons = self.ctx.konst(cons, l0);
@@ -349,53 +368,62 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             let y = self.ctx.app(cons, x);
             out = self.ctx.app(y, out);
         }
-        let f = self.konst0(self.names.string_of_list);
-        self.ctx.app(f, out)
+        let f = self.konst0(self.names.string_of_list)?;
+        Ok(self.ctx.app(f, out))
     }
 
-    fn nat_val(&mut self, e: ExprPtr<'t>) -> Option<BigUint> {
-        let w = self.whnf(e);
-        match *w {
+    fn nat_val(&mut self, e: ExprPtr<'t>) -> R<Option<BigUint>> {
+        let w = self.whnf(e)?;
+        Ok(match *w {
             Expr::NatLit { n, .. } => Some(n.as_ref().clone()),
             Expr::Const { name, .. } if Some(name) == self.names.nat_zero => Some(BigUint::zero()),
             _ => None,
-        }
+        })
     }
 
-    pub(crate) fn reduce_nat(&mut self, e: ExprPtr<'t>) -> Option<ExprPtr<'t>> {
+    pub(crate) fn reduce_nat(&mut self, e: ExprPtr<'t>) -> R<Option<ExprPtr<'t>>> {
         if e.has_local() {
-            return None;
+            return Ok(None);
         }
         let Expr::App { fun, arg, .. } = *e else {
-            return None;
+            return Ok(None);
         };
         let nargs = e.num_args();
         if nargs > 2 {
-            return None;
+            return Ok(None);
         }
         let Expr::Const { name, .. } = *e.head() else {
-            return None;
+            return Ok(None);
         };
-        let op = name.nat_red()?;
+        let Some(op) = name.nat_red() else {
+            return Ok(None);
+        };
         if nargs == 1 {
             if !nat::is_unary(op) {
-                return None;
+                return Ok(None);
             }
-            let x = self.nat_val(arg)?;
-            return Some(self.ctx.nat_lit(nat::unary(op, x)?));
+            let Some(x) = self.nat_val(arg)? else {
+                return Ok(None);
+            };
+            return Ok(nat::unary(op, x).map(|r| self.ctx.nat_lit(r)));
         }
         let Expr::App { arg: a, .. } = *fun else {
-            return None;
+            return Ok(None);
         };
         if nat::is_unary(op) {
-            return None;
+            return Ok(None);
         }
-        let x = self.nat_val(a)?;
-        let y = self.nat_val(arg)?;
-        Some(match nat::binary(op, x, y)? {
-            NatValue::Nat(r) => self.ctx.nat_lit(r),
-            NatValue::Bool(true) => self.konst0(self.names.bool_true),
-            NatValue::Bool(false) => self.konst0(self.names.bool_false),
-        })
+        let Some(x) = self.nat_val(a)? else {
+            return Ok(None);
+        };
+        let Some(y) = self.nat_val(arg)? else {
+            return Ok(None);
+        };
+        Ok(Some(match nat::binary(op, x, y) {
+            None => return Ok(None),
+            Some(NatValue::Nat(r)) => self.ctx.nat_lit(r),
+            Some(NatValue::Bool(true)) => self.konst0(self.names.bool_true)?,
+            Some(NatValue::Bool(false)) => self.konst0(self.names.bool_false)?,
+        }))
     }
 }

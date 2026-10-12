@@ -18,12 +18,14 @@ use crate::term::ctx::Ctx;
 use crate::term::decl::Declar;
 use crate::term::expr::Expr;
 use crate::term::intern::{Names, Store};
-use crate::term::outcome::{self, Decline, Failure};
+use crate::term::ops::LEVEL_FORM;
+use crate::term::outcome::{Decline, Failure, R, Stop};
 use crate::term::ptr::{ExprPtr, LevelPtr, LevelsPtr, NamePtr};
 use crate::term::{FxHashMap, FxHashSet};
 use crate::{ensure, reject};
-use env::Decls;
+use env::{Decls, strip_pis};
 use std::cell::Cell;
+use std::fmt;
 use std::rc::Rc;
 
 #[derive(Clone, Copy)]
@@ -80,7 +82,7 @@ pub fn check_shared<'a>(
     let mut tc = Tc::new(store, arena)
         .with_limits(limits)
         .with_adapter(adapter);
-    let result = outcome::run(|| tc.check(idx));
+    let result = tc.check(idx);
     (result, tc.steps_left)
 }
 
@@ -91,12 +93,10 @@ pub fn check_existing_only<'a>(
     limits: Limits,
     adapter: Option<&mut Adapter<'a>>,
 ) -> Result<(), Failure> {
-    outcome::run(|| {
-        Tc::new(store, arena)
-            .with_limits(limits)
-            .with_adapter(adapter)
-            .check_existing(idx);
-    })
+    let mut tc = Tc::new(store, arena)
+        .with_limits(limits)
+        .with_adapter(adapter);
+    tc.check_existing(idx).map_err(|_| tc.failure())
 }
 
 type ContextKey<'t> = (ExprPtr<'t>, Vec<ExprPtr<'t>>);
@@ -114,6 +114,7 @@ pub struct Tc<'t, 'a: 't> {
     probe_remaining: Option<u32>,
     limits: Limits,
     steps_left: u64,
+    fail: Option<Failure>,
     #[cfg(test)]
     probe_exhaustions: usize,
     open_infer_cache: [FxHashMap<ContextKey<'t>, ExprPtr<'t>>; 2],
@@ -149,6 +150,7 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             probe_remaining: None,
             limits: Limits::default(),
             steps_left: Limits::default().steps,
+            fail: None,
             #[cfg(test)]
             probe_exhaustions: 0,
             open_infer_cache: Default::default(),
@@ -175,9 +177,39 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         self
     }
 
-    pub fn check(&mut self, idx: u32) {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn reject(&mut self, msg: fmt::Arguments<'_>) -> Stop {
+        self.fail = Some(Failure::Rejected(msg.to_string()));
+        Stop
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn decline(&mut self, budget: Budget) -> Stop {
+        self.fail = Some(Failure::Declined(Decline::Exhausted(budget)));
+        Stop
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn failed(&mut self, failure: Failure) -> Stop {
+        self.fail = Some(failure);
+        Stop
+    }
+
+    /// The failure behind a `Stop` that reached the top of the check.
+    pub(crate) fn failure(&mut self) -> Failure {
+        Failure::escaped(&mut self.fail)
+    }
+
+    pub fn check(&mut self, idx: u32) -> Result<(), Failure> {
+        self.check_in(idx).map_err(|_| self.failure())
+    }
+
+    fn check_in(&mut self, idx: u32) -> R<()> {
         if self.ctx.arena.allocated_bytes() > self.limits.arena_bytes {
-            Budget::Arena.decline();
+            return Err(self.decline(Budget::Arena));
         }
         self.infer_cache
             .iter_mut()
@@ -203,30 +235,73 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         match d {
             Declar::Axiom(i) => self.check_type(i.ty),
             Declar::Def(i, v, _) | Declar::Opaque(i, v) => {
-                self.check_type(i.ty);
-                self.check_value(v, i.ty);
+                self.check_type(i.ty)?;
+                self.check_value(v, i.ty)
             }
             Declar::Thm(i, v) => {
-                self.check_type(i.ty);
-                ensure!(self.is_prop(i.ty), "theorem type is not a proposition");
-                self.check_value(v, i.ty);
+                self.check_type(i.ty)?;
+                ensure!(
+                    self,
+                    self.is_prop(i.ty)?,
+                    "theorem type is not a proposition"
+                );
+                self.check_value(v, i.ty)
             }
             Declar::Quot(i) => {
-                self.check_type(i.ty);
-                self.check_quot(i);
+                self.check_type(i.ty)?;
+                self.check_quot(i)
             }
             Declar::Ind(_) | Declar::Ctor(_) | Declar::Rec(_) => self.check_inductive(idx, d),
         }
     }
 
-    pub(crate) fn check_type(&mut self, ty: ExprPtr<'t>) {
-        let s = self.infer(ty, false);
-        self.ensure_sort(s);
+    pub(crate) fn check_type(&mut self, ty: ExprPtr<'t>) -> R<()> {
+        let s = self.infer(ty, false)?;
+        self.ensure_sort(s)?;
+        Ok(())
     }
 
-    fn check_value(&mut self, v: ExprPtr<'t>, ty: ExprPtr<'t>) {
-        let vt = self.infer(v, false);
-        ensure!(self.def_eq(vt, ty), "declaration type mismatch");
+    fn check_value(&mut self, v: ExprPtr<'t>, ty: ExprPtr<'t>) -> R<()> {
+        let vt = self.infer(v, false)?;
+        ensure!(self, self.def_eq(vt, ty)?, "declaration type mismatch");
+        Ok(())
+    }
+
+    pub(crate) fn level_eq(&mut self, a: LevelPtr<'t>, b: LevelPtr<'t>) -> R<bool> {
+        let Some(r) = self.ctx.try_level_eq(a, b) else {
+            reject!(self, "{LEVEL_FORM}")
+        };
+        Ok(r)
+    }
+
+    pub(crate) fn levels_eq(&mut self, a: LevelsPtr<'t>, b: LevelsPtr<'t>) -> R<bool> {
+        let Some(r) = self.ctx.try_levels_eq(a, b) else {
+            reject!(self, "{LEVEL_FORM}")
+        };
+        Ok(r)
+    }
+
+    pub(crate) fn leq(&mut self, a: LevelPtr<'t>, b: LevelPtr<'t>) -> R<bool> {
+        let Some(r) = self.ctx.try_leq(a, b) else {
+            reject!(self, "{LEVEL_FORM}")
+        };
+        Ok(r)
+    }
+
+    pub(crate) fn is_zero(&mut self, l: LevelPtr<'t>) -> R<bool> {
+        let z = self.ctx.zero();
+        self.leq(l, z)
+    }
+
+    pub(crate) fn inst(&mut self, e: ExprPtr<'t>, subs: &[ExprPtr<'t>]) -> R<ExprPtr<'t>> {
+        let Some(r) = self.ctx.inst(e, subs) else {
+            reject!(self, "variable index overflow")
+        };
+        Ok(r)
+    }
+
+    pub(crate) fn inst1(&mut self, e: ExprPtr<'t>, s: ExprPtr<'t>) -> R<ExprPtr<'t>> {
+        self.inst(e, &[s])
     }
 
     pub(crate) fn fresh_local(&mut self, ty: ExprPtr<'t>) -> ExprPtr<'t> {
@@ -238,125 +313,135 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         self.ctx.levels(&[])
     }
 
-    pub(crate) fn konst0(&mut self, n: Option<NamePtr<'t>>) -> ExprPtr<'t> {
+    pub(crate) fn konst0(&mut self, n: Option<NamePtr<'t>>) -> R<ExprPtr<'t>> {
         let Some(n) = n else {
-            reject!("missing builtin constant")
+            reject!(self, "missing builtin constant")
         };
         let ls = self.empty_levels();
-        self.ctx.konst(n, ls)
+        Ok(self.ctx.konst(n, ls))
     }
 
-    pub(crate) fn ensure_sort(&mut self, e: ExprPtr<'t>) -> LevelPtr<'t> {
+    pub(crate) fn ensure_sort(&mut self, e: ExprPtr<'t>) -> R<LevelPtr<'t>> {
         if let Expr::Sort { level, .. } = *e {
-            return level;
+            return Ok(level);
         }
-        match *self.whnf(e) {
-            Expr::Sort { level, .. } => level,
-            _ => reject!("expected a sort"),
+        match *self.whnf(e)? {
+            Expr::Sort { level, .. } => Ok(level),
+            _ => reject!(self, "expected a sort"),
         }
     }
 
-    pub(crate) fn ensure_pi(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
+    pub(crate) fn ensure_pi(&mut self, e: ExprPtr<'t>) -> R<ExprPtr<'t>> {
         if e.is_pi() {
-            return e;
+            return Ok(e);
         }
-        let w = self.whnf(e);
-        ensure!(w.is_pi(), "expected a function type");
-        w
+        let w = self.whnf(e)?;
+        ensure!(self, w.is_pi(), "expected a function type");
+        Ok(w)
     }
 
-    pub(crate) fn is_prop(&mut self, e: ExprPtr<'t>) -> bool {
-        let t = self.infer(e, true);
-        let t = self.whnf(t);
+    pub(crate) fn is_prop(&mut self, e: ExprPtr<'t>) -> R<bool> {
+        let t = self.infer(e, true)?;
+        let t = self.whnf(t)?;
         match *t {
-            Expr::Sort { level, .. } => self.ctx.level_eq(level, self.ctx.zero()),
-            _ => false,
+            Expr::Sort { level, .. } => self.is_zero(level),
+            _ => Ok(false),
         }
     }
 
-    fn check_level(&self, l: LevelPtr<'t>) {
-        ensure!(l.params_in(self.uparams), "undeclared universe parameter");
+    fn check_level(&mut self, l: LevelPtr<'t>) -> R<()> {
+        ensure!(
+            self,
+            l.params_in(self.uparams),
+            "undeclared universe parameter"
+        );
+        Ok(())
     }
 
-    pub fn infer(&mut self, e: ExprPtr<'t>, only: bool) -> ExprPtr<'t> {
-        self.tick();
+    pub fn infer(&mut self, e: ExprPtr<'t>, only: bool) -> R<ExprPtr<'t>> {
+        self.tick()?;
         if let Some(&r) = self.infer_cache[0].get(&e) {
-            return r;
+            return Ok(r);
         }
         if only && let Some(&r) = self.infer_cache[1].get(&e) {
-            return r;
+            return Ok(r);
         }
         let r = match *e {
-            Expr::Var { .. } => reject!("unexpected bound variable"),
+            Expr::Var { .. } => reject!(self, "unexpected bound variable"),
             Expr::Local { ty, .. } => ty,
             Expr::Sort { level, .. } => {
                 if !only {
-                    self.check_level(level);
+                    self.check_level(level)?;
                 }
                 let l = self.ctx.succ(level);
                 self.ctx.sort(l)
             }
             Expr::Const { name, levels, .. } => {
                 let Some(d) = self.declar(name) else {
-                    reject!("unknown constant {}", name.as_ref())
+                    reject!(self, "unknown constant {}", name.as_ref())
                 };
                 ensure!(
+                    self,
                     levels.len() == d.uparams().len(),
                     "wrong number of universe levels for {}",
                     name.as_ref()
                 );
                 if !only {
                     for &l in levels.as_ref() {
-                        self.check_level(l);
+                        self.check_level(l)?;
                     }
                 }
                 self.ctx.declar_type(&d, levels)
             }
-            Expr::App { .. } => self.infer_app(e, only),
+            Expr::App { .. } => self.infer_app(e, only)?,
             Expr::Lam { .. } | Expr::Pi { .. } | Expr::Let { .. } => {
-                self.infer_contextual(e, &mut Vec::new(), only)
+                self.infer_contextual(e, &mut Vec::new(), only)?
             }
             Expr::Proj {
                 name, idx, e: s, ..
-            } => self.infer_proj(name, idx, s, only),
-            Expr::NatLit { .. } => self.literal_type(self.names.nat),
-            Expr::StrLit { .. } => self.literal_type(self.names.string),
+            } => self.infer_proj(name, idx, s, only)?,
+            Expr::NatLit { .. } => self.literal_type(self.names.nat)?,
+            Expr::StrLit { .. } => self.literal_type(self.names.string)?,
         };
         self.infer_cache[usize::from(only)].insert(e, r);
-        r
+        Ok(r)
     }
 
-    fn literal_type(&mut self, name: Option<NamePtr<'t>>) -> ExprPtr<'t> {
-        let ty = self.konst0(name);
-        let sort = self.infer(ty, true);
+    fn literal_type(&mut self, name: Option<NamePtr<'t>>) -> R<ExprPtr<'t>> {
+        let ty = self.konst0(name)?;
+        let sort = self.infer(ty, true)?;
         let one = self.ctx.succ(self.ctx.zero());
         let expected = self.ctx.sort(one);
-        ensure!(self.def_eq(sort, expected), "invalid literal type");
-        ty
+        ensure!(self, self.def_eq(sort, expected)?, "invalid literal type");
+        Ok(ty)
     }
 
-    fn infer_app(&mut self, e: ExprPtr<'t>, only: bool) -> ExprPtr<'t> {
+    fn infer_app(&mut self, e: ExprPtr<'t>, only: bool) -> R<ExprPtr<'t>> {
         let (f, args) = self.ctx.unfold_apps(e);
-        let mut ft = self.infer(f, only);
+        let mut ft = self.infer(f, only)?;
         let mut j = 0;
         for i in 0..args.len() {
-            self.tick();
+            self.tick()?;
             if !ft.is_pi() {
-                ft = self.ctx.inst(ft, &args[j..i]);
-                ft = self.ensure_pi(ft);
+                ft = self.inst(ft, &args[j..i])?;
+                ft = self.ensure_pi(ft)?;
                 j = i;
             }
             let Expr::Pi { ty, body, .. } = *ft else {
                 unreachable!()
             };
             if !only {
-                let domain = self.ctx.inst(ty, &args[j..i]);
-                let actual = self.infer(args[i], false);
-                ensure!(self.def_eq(actual, domain), "application type mismatch");
+                let domain = self.inst(ty, &args[j..i])?;
+                let actual = self.infer(args[i], false)?;
+                ensure!(
+                    self,
+                    self.def_eq(actual, domain)?,
+                    "application type mismatch"
+                );
             }
             ft = body;
         }
-        self.ctx.inst(ft, &args[j..])
+        self.inst(ft, &args[j..])
     }
 
     fn infer_proj(
@@ -365,10 +450,10 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         idx: u16,
         s: ExprPtr<'t>,
         only: bool,
-    ) -> ExprPtr<'t> {
-        let st = self.infer(s, only);
-        let is_prop = self.is_prop(st);
-        let st = self.whnf(st);
+    ) -> R<ExprPtr<'t>> {
+        let st = self.infer(s, only)?;
+        let is_prop = self.is_prop(st)?;
+        let st = self.whnf(st)?;
         let (h, args) = self.ctx.unfold_apps(st);
         let Expr::Const {
             name: iname,
@@ -376,37 +461,41 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             ..
         } = *h
         else {
-            reject!("projection of a non-structure")
+            reject!(self, "projection of a non-structure")
         };
-        ensure!(iname == name, "projection type mismatch");
+        ensure!(self, iname == name, "projection type mismatch");
         let Some((ind, ctor)) = self.single_ctor(name) else {
-            reject!("projection of a non-structure")
+            reject!(self, "projection of a non-structure")
         };
         ensure!(
+            self,
             args.len() == usize::from(ind.num_params),
             "projection of a non-structure"
         );
         let ct = self.ctx.declar_type(&Declar::Ctor(ctor), levels);
-        let mut r = self.ctx.inst_pis(ct, &args);
+        let Some(ct) = strip_pis(ct, args.len()) else {
+            reject!(self, "expected a Pi binder")
+        };
+        let mut r = self.inst(ct, &args)?;
         for i in 0..idx {
-            r = self.whnf(r);
+            r = self.whnf(r)?;
             let Expr::Pi { ty, body, .. } = *r else {
-                reject!("invalid projection")
+                reject!(self, "invalid projection")
             };
             if body.nlb() > 0 {
-                ensure!(!is_prop || self.is_prop(ty), "invalid projection");
+                ensure!(self, !is_prop || self.is_prop(ty)?, "invalid projection");
                 let p = self.ctx.proj(name, i, s);
-                r = self.ctx.inst1(body, p);
+                r = self.inst1(body, p)?;
             } else {
                 r = body;
             }
         }
-        r = self.whnf(r);
+        r = self.whnf(r)?;
         let Expr::Pi { ty, .. } = *r else {
-            reject!("invalid projection")
+            reject!(self, "invalid projection")
         };
-        ensure!(!is_prop || self.is_prop(ty), "invalid projection");
-        ty
+        ensure!(self, !is_prop || self.is_prop(ty)?, "invalid projection");
+        Ok(ty)
     }
 }
 

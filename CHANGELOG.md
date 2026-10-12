@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Split the Mathlib CI script into shell and Python files and drop the perf probe.
 - Gate quotient reduction on `Quot` declarations.
 - Reject quotient names on other declarations.
 - Add `quot-axiom` mutation operator.
@@ -21,6 +22,9 @@
 - Check Mathlib and corpora as blean in CI.
 - Upgrade olean-export to 0.3.0.
 - Replace `stacker` with a stack floor guard that declines a declaration instead of overflowing.
+- Return value checker rejections and declines through `R` instead of unwinding.
+- Return reference checker rejections and declines through `R` and drop the panic channel.
+- Pin function alignment to 64 bytes so code placement cannot move the hot loops.
 
 ## 0.1.0 (2026-10-08)
 

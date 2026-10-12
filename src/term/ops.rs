@@ -3,7 +3,6 @@ use super::decl::Declar;
 use super::expr::Expr;
 use super::level::Level;
 use super::ptr::{ExprPtr, LevelPtr, LevelsPtr};
-use crate::reject;
 
 const OP_LIFT: u32 = 1 << 24;
 const OP_INST: u32 = 2 << 24;
@@ -98,15 +97,21 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
         self.levels(&out)
     }
 
-    fn leq_cases(&mut self, p: LevelPtr<'t>, l: LevelPtr<'t>, r: LevelPtr<'t>, diff: i32) -> bool {
+    fn leq_cases(
+        &mut self,
+        p: LevelPtr<'t>,
+        l: LevelPtr<'t>,
+        r: LevelPtr<'t>,
+        diff: i32,
+    ) -> Option<bool> {
         let zero = self.zero();
         let sp = self.succ(p);
         let (ps, zs, ss) = (self.levels(&[p]), self.levels(&[zero]), self.levels(&[sp]));
         let l0 = self.subst_level(l, ps, zs);
         let r0 = self.subst_level(r, ps, zs);
         let (l0, r0) = (self.simplify(l0), self.simplify(r0));
-        if !self.leq_core(l0, r0, diff) {
-            return false;
+        if !self.leq_core(l0, r0, diff)? {
+            return Some(false);
         }
         let l1 = self.subst_level(l, ps, ss);
         let r1 = self.subst_level(r, ps, ss);
@@ -114,32 +119,33 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
         self.leq_core(l1, r1, diff)
     }
 
-    fn leq_core(&mut self, l: LevelPtr<'t>, r: LevelPtr<'t>, diff: i32) -> bool {
-        match (*l, *r) {
+    /// `None` when the comparison reaches a form normalization should have removed.
+    fn leq_core(&mut self, l: LevelPtr<'t>, r: LevelPtr<'t>, diff: i32) -> Option<bool> {
+        Some(match (*l, *r) {
             (Level::Zero, _) if diff >= 0 => true,
             (_, Level::Zero) if diff < 0 => false,
             (Level::Param(a, _), Level::Param(b, _)) => a == b && diff >= 0,
             (Level::Param(..), Level::Zero) => false,
             (Level::Zero, Level::Param(..)) => diff >= 0,
-            (Level::Succ(a, _), _) => self.leq_core(a, r, diff - 1),
-            (_, Level::Succ(b, _)) => self.leq_core(l, b, diff + 1),
-            (Level::Max(a, b, _), _) => self.leq_core(a, r, diff) && self.leq_core(b, r, diff),
+            (Level::Succ(a, _), _) => self.leq_core(a, r, diff - 1)?,
+            (_, Level::Succ(b, _)) => self.leq_core(l, b, diff + 1)?,
+            (Level::Max(a, b, _), _) => self.leq_core(a, r, diff)? && self.leq_core(b, r, diff)?,
             (Level::Param(..) | Level::Zero, Level::Max(a, b, _)) => {
-                self.leq_core(l, a, diff) || self.leq_core(l, b, diff)
+                self.leq_core(l, a, diff)? || self.leq_core(l, b, diff)?
             }
             (Level::IMax(a, b, _), Level::IMax(x, y, _)) if a == x && b == y && diff >= 0 => true,
-            (Level::IMax(_, b, _), _) if b.is_param() => self.leq_cases(b, l, r, diff),
-            (_, Level::IMax(_, y, _)) if y.is_param() => self.leq_cases(y, l, r, diff),
+            (Level::IMax(_, b, _), _) if b.is_param() => self.leq_cases(b, l, r, diff)?,
+            (_, Level::IMax(_, y, _)) if y.is_param() => self.leq_cases(y, l, r, diff)?,
             (Level::IMax(a, b, _), _) if b.is_any_max() => {
                 let d = self.distribute_imax(a, b);
-                self.leq_core(d, r, diff)
+                self.leq_core(d, r, diff)?
             }
             (_, Level::IMax(x, y, _)) if y.is_any_max() => {
                 let d = self.distribute_imax(x, y);
-                self.leq_core(l, d, diff)
+                self.leq_core(l, d, diff)?
             }
-            _ => reject!("universe comparison reached an unexpected form"),
-        }
+            _ => return None,
+        })
     }
 
     fn distribute_imax(&mut self, a: LevelPtr<'t>, b: LevelPtr<'t>) -> LevelPtr<'t> {
@@ -159,28 +165,38 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
         }
     }
 
-    pub fn leq(&mut self, l: LevelPtr<'t>, r: LevelPtr<'t>) -> bool {
+    pub fn try_leq(&mut self, l: LevelPtr<'t>, r: LevelPtr<'t>) -> Option<bool> {
         if l == r {
-            return true;
+            return Some(true);
         }
         let l = self.simplify(l);
         let r = self.simplify(r);
         self.leq_core(l, r, 0)
     }
 
-    pub fn level_eq(&mut self, l: LevelPtr<'t>, r: LevelPtr<'t>) -> bool {
-        l == r || (self.leq(l, r) && self.leq(r, l))
+    pub fn try_level_eq(&mut self, l: LevelPtr<'t>, r: LevelPtr<'t>) -> Option<bool> {
+        Some(l == r || (self.try_leq(l, r)? && self.try_leq(r, l)?))
     }
 
-    pub fn levels_eq(&mut self, xs: LevelsPtr<'t>, ys: LevelsPtr<'t>) -> bool {
-        xs == ys
-            || (xs.len() == ys.len()
-                && xs.iter().zip(ys.iter()).all(|(&x, &y)| self.level_eq(x, y)))
+    pub fn try_levels_eq(&mut self, xs: LevelsPtr<'t>, ys: LevelsPtr<'t>) -> Option<bool> {
+        if xs == ys {
+            return Some(true);
+        }
+        if xs.len() != ys.len() {
+            return Some(false);
+        }
+        for (&x, &y) in xs.iter().zip(ys.iter()) {
+            if !self.try_level_eq(x, y)? {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
-    pub fn is_zero(&mut self, l: LevelPtr<'t>) -> bool {
+    /// Inconclusive counts as not zero, which only leaves `imax` less simplified.
+    fn is_zero(&mut self, l: LevelPtr<'t>) -> bool {
         let z = self.zero();
-        self.leq(l, z)
+        self.try_leq(l, z).unwrap_or(false)
     }
 
     fn is_one(&mut self, l: LevelPtr<'t>) -> bool {
@@ -247,19 +263,23 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
             return r;
         }
         let r = match *e {
-            Expr::Var { idx, .. } => self.var(
-                idx.checked_add(amount)
-                    .unwrap_or_else(|| reject!("variable index overflow")),
-            ),
+            Expr::Var { idx, .. } => match idx.checked_add(amount) {
+                Some(i) => self.var(i),
+                None => {
+                    self.overflow = true;
+                    e
+                }
+            },
             _ => self.map_children(e, |c, x, d| c.lift_rec(x, cutoff + d, amount, g)),
         };
         self.memo.insert(key, (g, r));
         r
     }
 
-    pub fn inst(&mut self, e: ExprPtr<'t>, subs: &[ExprPtr<'t>]) -> ExprPtr<'t> {
+    /// `None` when a lifted variable index would overflow.
+    pub fn inst(&mut self, e: ExprPtr<'t>, subs: &[ExprPtr<'t>]) -> Option<ExprPtr<'t>> {
         if subs.is_empty() || e.closed() {
-            return e;
+            return Some(e);
         }
         // Sound because a closed replacement needs no lifting and pointers capture all inputs.
         let key = match subs {
@@ -269,20 +289,23 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
         if let Some(key) = key
             && let Some(&result) = self.inst_cache.get(&key)
         {
-            return result;
+            return Some(result);
         }
         let g = self.fresh();
         let result = self.inst_rec(e, subs, 0, g);
+        if std::mem::take(&mut self.overflow) {
+            return None;
+        }
         if let Some(key) = key {
             if self.inst_cache.len() == INST_CACHE_LIMIT {
                 self.inst_cache.clear();
             }
             self.inst_cache.insert(key, result);
         }
-        result
+        Some(result)
     }
 
-    pub fn inst1(&mut self, e: ExprPtr<'t>, s: ExprPtr<'t>) -> ExprPtr<'t> {
+    pub fn inst1(&mut self, e: ExprPtr<'t>, s: ExprPtr<'t>) -> Option<ExprPtr<'t>> {
         self.inst(e, &[s])
     }
 
@@ -385,20 +408,12 @@ impl<'t, 'a: 't> Ctx<'t, 'a> {
         (e, args)
     }
 
-    pub fn inst_pis(&mut self, mut e: ExprPtr<'t>, args: &[ExprPtr<'t>]) -> ExprPtr<'t> {
-        for _ in args {
-            match *e {
-                Expr::Pi { body, .. } => e = body,
-                _ => reject!("expected a Pi binder"),
-            }
-        }
-        self.inst(e, args)
-    }
-
     pub fn declar_type(&mut self, d: &Declar<'t>, levels: LevelsPtr<'t>) -> ExprPtr<'t> {
         self.subst_expr_levels(d.ty(), d.uparams(), levels)
     }
 }
+
+pub(crate) const LEVEL_FORM: &str = "universe comparison reached an unexpected form";
 
 #[cfg(test)]
 mod tests {
@@ -437,16 +452,16 @@ mod tests {
             ] {
                 let generation = ctx.fresh();
                 let expected = ctx.inst_rec(expression, &substitutions, 0, generation);
-                assert_eq!(ctx.inst(expression, &substitutions), expected);
+                assert_eq!(ctx.inst(expression, &substitutions), Some(expected));
                 ctx.inst(expression, &[other_local, prop]);
-                assert_eq!(ctx.inst(expression, &substitutions), expected);
+                assert_eq!(ctx.inst(expression, &substitutions), Some(expected));
             }
         }
         let body = ctx.app(v0, v1);
         let abstraction = ctx.lam(prop, body);
         let expected_body = ctx.app(v0, v2);
         let expected = ctx.lam(prop, expected_body);
-        assert_eq!(ctx.inst1(abstraction, v1), expected);
+        assert_eq!(ctx.inst1(abstraction, v1), Some(expected));
     }
 
     #[test]
@@ -465,7 +480,7 @@ mod tests {
             let var = ctx.var(0);
             for id in 0..5000 {
                 let local = ctx.local(id + round * 5000, prop);
-                assert_eq!(ctx.inst1(var, local), local);
+                assert_eq!(ctx.inst1(var, local), Some(local));
                 assert!(ctx.inst_cache.len() <= INST_CACHE_LIMIT);
             }
             // Lifting this variable must hit checked arithmetic in release builds too.
@@ -481,12 +496,10 @@ mod tests {
                 nested = ctx.lam(prop, nested);
             }
             let before = ctx.inst_cache.len();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ctx.inst1(nested, near_limit)
-            }));
-            assert!(result.is_err());
+            assert!(ctx.inst1(nested, near_limit).is_none());
+            assert!(!ctx.overflow);
             assert_eq!(ctx.inst_cache.len(), before);
-            assert_eq!(ctx.inst1(var, prop), prop);
+            assert_eq!(ctx.inst1(var, prop), Some(prop));
             drop(ctx);
             arena.reset();
         }

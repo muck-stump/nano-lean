@@ -1,13 +1,9 @@
 use crate::checker::{self, Adapter, Limits};
 use crate::export::{ExportError, check_export};
 use crate::import;
-use crate::term::{
-    arena::Arena,
-    intern::Store,
-    outcome::{self, Failure},
-};
+use crate::term::{arena::Arena, intern::Store, outcome::Failure};
 use crate::value_checker::Session;
-use std::{fmt, sync::Once, thread};
+use std::{fmt, thread};
 
 const STACK_BYTES: usize = 256 << 20;
 
@@ -82,11 +78,10 @@ impl fmt::Display for Verdicts {
 }
 
 fn reference(source: &str) -> Verdict {
-    match outcome::run(|| check_export(source.as_bytes())) {
-        Ok(Ok(_)) => Verdict::Accepted,
-        Ok(Err(ExportError::Invalid(s))) => Verdict::Rejected(s),
-        Ok(Err(ExportError::Unsupported(s))) => Verdict::Unsupported(s),
-        Err(f) => Verdict::Internal(f.reason().to_owned()),
+    match check_export(source.as_bytes()) {
+        Ok(_) => Verdict::Accepted,
+        Err(ExportError::Invalid(s)) => Verdict::Rejected(s),
+        Err(ExportError::Unsupported(s)) => Verdict::Unsupported(s),
     }
 }
 
@@ -144,8 +139,6 @@ fn fast(source: &str, limits: Limits, core: Core) -> Verdict {
 }
 
 pub fn check(source: &str, limits: Limits) -> Verdicts {
-    static HOOK: Once = Once::new();
-    HOOK.call_once(outcome::install_hook);
     thread::scope(|s| {
         thread::Builder::new()
             .stack_size(STACK_BYTES)

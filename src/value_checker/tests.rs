@@ -2,7 +2,7 @@ use super::*;
 use crate::checker::{self, Adapter};
 use crate::import::import_bytes;
 use crate::resource::Budget;
-use crate::term::outcome::{self, Decline, Failure};
+use crate::term::outcome::{Decline, Failure};
 use std::fmt::Write;
 
 macro_rules! fixtures {
@@ -43,7 +43,6 @@ fn fixture_outcomes_match_the_term_checker() {
         "theorem-reduction.ndjson",
         "valid-deep-sparse-scope.ndjson"
     );
-    outcome::install_hook();
     for (file, bytes) in all {
         let arena = Arena::new();
         let store = import_bytes(&arena, bytes).unwrap();
@@ -115,7 +114,6 @@ fn deep_term_declines_instead_of_overflowing() {
         4 + DEPTH
     )
     .unwrap();
-    outcome::install_hook();
     std::thread::Builder::new()
         .stack_size(4 << 20)
         .spawn(move || {

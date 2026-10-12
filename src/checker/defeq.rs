@@ -3,11 +3,10 @@ use super::env::{Decls, positive, strip_pis, unfold_order};
 use crate::resource::Budget;
 use crate::term::decl::Hint;
 use crate::term::expr::Expr;
-use crate::term::outcome::{ProbeExhausted, raise};
+use crate::term::outcome::{R, Stop};
 use crate::term::ptr::ExprPtr;
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 const ARENA_CHECK_MASK: u64 = 1023;
@@ -24,41 +23,42 @@ impl Drop for ConversionScope {
 }
 
 impl<'t, 'a: 't> Tc<'t, 'a> {
-    pub fn def_eq(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
-        self.tick();
+    pub fn def_eq(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
+        self.tick()?;
         if t == s || self.eq_cache.contains(&(t, s)) {
-            return true;
+            return Ok(true);
         }
-        let r = self.def_eq_core(t, s);
+        let r = self.def_eq_core(t, s)?;
         if r {
             self.eq_cache.insert((t, s));
             self.eq_cache.insert((s, t));
         }
-        r
+        Ok(r)
     }
 
-    pub(crate) fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) -> R<()> {
         if self.steps_left == 0 {
-            Budget::Work.decline();
+            return Err(self.decline(Budget::Work));
         }
         self.steps_left -= 1;
         if self.steps_left & ARENA_CHECK_MASK == 0
             && self.ctx.arena.allocated_bytes() > self.limits.arena_bytes
         {
-            Budget::Arena.decline();
+            return Err(self.decline(Budget::Arena));
         }
         if let Some(remaining) = &mut self.probe_remaining {
             if *remaining == 0 {
-                raise(ProbeExhausted);
+                return Err(Stop);
             }
             *remaining -= 1;
         }
+        Ok(())
     }
 
     /// Failure or exhaustion is inconclusive since delta may still prove equality.
-    pub(super) fn probe_args(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
+    pub(super) fn probe_args(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
         if self.fail_cache.contains(&(t, s)) {
-            return false;
+            return Ok(false);
         }
         if self.probe_remaining.is_some() {
             return self.args_eq(t, s);
@@ -68,25 +68,25 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         } else {
             PROBE_STEPS
         });
-        let result = panic::catch_unwind(AssertUnwindSafe(|| self.args_eq(t, s)));
+        let result = self.args_eq(t, s);
         self.probe_remaining = None;
         let equal = match result {
             Ok(equal) => equal,
-            Err(p) if p.is::<ProbeExhausted>() => {
+            Err(Stop) if self.fail.is_none() => {
                 #[cfg(test)]
                 {
                     self.probe_exhaustions += 1;
                 }
                 false
             }
-            Err(p) => panic::resume_unwind(p),
+            Err(Stop) => return Err(Stop),
         };
         if !equal {
             // Caching an inconclusive probe only skips speculation, not reduction or eta.
             self.fail_cache.insert((t, s));
             self.fail_cache.insert((s, t));
         }
-        equal
+        Ok(equal)
     }
 
     fn small_delta_body(&self, e: ExprPtr<'t>) -> bool {
@@ -125,24 +125,24 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         small(body, &mut budget)
     }
 
-    fn quick(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> Option<bool> {
+    fn quick(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<Option<bool>> {
         if t == s || self.eq_cache.contains(&(t, s)) {
-            return Some(true);
+            return Ok(Some(true));
         }
-        match (*t, *s) {
+        Ok(match (*t, *s) {
             (Expr::Lam { .. }, Expr::Lam { .. }) | (Expr::Pi { .. }, Expr::Pi { .. }) => {
-                Some(self.def_eq_binding(t, s))
+                Some(self.def_eq_binding(t, s)?)
             }
             (Expr::Sort { level: a, .. }, Expr::Sort { level: b, .. }) => {
-                Some(self.ctx.level_eq(a, b))
+                Some(self.level_eq(a, b)?)
             }
             (Expr::NatLit { .. }, Expr::NatLit { .. })
             | (Expr::StrLit { .. }, Expr::StrLit { .. }) => Some(false),
             _ => None,
-        }
+        })
     }
 
-    fn def_eq_binding(&mut self, mut t: ExprPtr<'t>, mut s: ExprPtr<'t>) -> bool {
+    fn def_eq_binding(&mut self, mut t: ExprPtr<'t>, mut s: ExprPtr<'t>) -> R<bool> {
         let _scope = ConversionScope(self.conversion_depth.clone(), self.conversion_depth.get());
         let pi = t.is_pi();
         let mut locals = Vec::new();
@@ -165,15 +165,15 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             if t.is_pi() != pi || s.is_pi() != pi {
                 break;
             }
-            let sd = self.ctx.inst(st, &locals);
+            let sd = self.inst(st, &locals)?;
             if tt != st {
-                let td = self.ctx.inst(tt, &locals);
-                if !self.def_eq(td, sd) {
-                    return false;
+                let td = self.inst(tt, &locals)?;
+                if !self.def_eq(td, sd)? {
+                    return Ok(false);
                 }
             }
             if tb == sb {
-                return true;
+                return Ok(true);
             }
             let l = if tb.nlb() > 0 || sb.nlb() > 0 {
                 let key = (self.conversion_depth.get(), sd);
@@ -192,44 +192,44 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             t = tb;
             s = sb;
         }
-        let t = self.ctx.inst(t, &locals);
-        let s = self.ctx.inst(s, &locals);
+        let t = self.inst(t, &locals)?;
+        let s = self.inst(s, &locals)?;
         self.def_eq(t, s)
     }
 
-    fn def_eq_core(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
-        if let Some(r) = self.quick(t, s) {
-            return r;
+    fn def_eq_core(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
+        if let Some(r) = self.quick(t, s)? {
+            return Ok(r);
         }
         if let Some(bt) = self.names.bool_true
             && !t.has_local()
             && s.const_name() == Some(bt)
-            && self.whnf(t).const_name() == Some(bt)
+            && self.whnf(t)?.const_name() == Some(bt)
         {
-            return true;
+            return Ok(true);
         }
         if !self.statically_not_proof(t)
-            && let Some(r) = self.proof_irrel(t, s)
+            && let Some(r) = self.proof_irrel(t, s)?
         {
-            return r;
+            return Ok(r);
         }
         if t.num_args() == s.num_args()
             && t.num_args() > 0
             && self.delta_hint(t).is_some()
-            && self.same_const_head(t, s)
-            && self.probe_args(t, s)
+            && self.same_const_head(t, s)?
+            && self.probe_args(t, s)?
         {
-            return true;
+            return Ok(true);
         }
-        let tn = self.whnf_core(t);
-        let sn = self.whnf_core(s);
+        let tn = self.whnf_core(t)?;
+        let sn = self.whnf_core(s)?;
         if (tn != t || sn != s)
-            && let Some(r) = self.quick(tn, sn)
+            && let Some(r) = self.quick(tn, sn)?
         {
-            return r;
+            return Ok(r);
         }
-        let (tn, sn) = match self.lazy_delta(tn, sn) {
-            Ok(r) => return r,
+        let (tn, sn) = match self.lazy_delta(tn, sn)? {
+            Ok(r) => return Ok(r),
             Err(p) => p,
         };
         match (*tn, *sn) {
@@ -245,32 +245,32 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                     ..
                 },
             ) => {
-                if a == b && self.ctx.levels_eq(la, lb) {
-                    return true;
+                if a == b && self.levels_eq(la, lb)? {
+                    return Ok(true);
                 }
             }
             (Expr::Proj { idx: i, e: x, .. }, Expr::Proj { idx: j, e: y, .. })
-                if i == j && self.def_eq(x, y) =>
+                if i == j && self.def_eq(x, y)? =>
             {
-                return true;
+                return Ok(true);
             }
             _ => {}
         }
-        let tnn = self.whnf_core(tn);
-        let snn = self.whnf_core(sn);
+        let tnn = self.whnf_core(tn)?;
+        let snn = self.whnf_core(sn)?;
         if tnn != tn || snn != sn {
             return self.def_eq_core(tnn, snn);
         }
-        if self.def_eq_app(tn, sn)
-            || self.eta(tn, sn)
-            || self.eta(sn, tn)
-            || self.eta_struct(tn, sn)
-            || self.eta_struct(sn, tn)
+        if self.def_eq_app(tn, sn)?
+            || self.eta(tn, sn)?
+            || self.eta(sn, tn)?
+            || self.eta_struct(tn, sn)?
+            || self.eta_struct(sn, tn)?
         {
-            return true;
+            return Ok(true);
         }
-        if let Some(r) = self.string_expand(tn, sn) {
-            return r;
+        if let Some(r) = self.string_expand(tn, sn)? {
+            return Ok(r);
         }
         self.unit_like(tn, sn)
     }
@@ -301,13 +301,13 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         strip_pis(ty, e.num_args())
     }
 
-    fn proof_irrel(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> Option<bool> {
-        let tt = self.infer(t, true);
-        if !self.is_prop(tt) {
-            return None;
+    fn proof_irrel(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<Option<bool>> {
+        let tt = self.infer(t, true)?;
+        if !self.is_prop(tt)? {
+            return Ok(None);
         }
-        let st = self.infer(s, true);
-        Some(self.def_eq(tt, st))
+        let st = self.infer(s, true)?;
+        Ok(Some(self.def_eq(tt, st)?))
     }
 
     fn is_nat_zero(&self, e: ExprPtr<'t>) -> bool {
@@ -330,60 +330,62 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         }
     }
 
-    fn offset(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> Option<bool> {
+    fn offset(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<Option<bool>> {
         if self.is_nat_zero(t) && self.is_nat_zero(s) {
-            return Some(true);
+            return Ok(Some(true));
         }
-        let a = self.nat_pred(t)?;
-        let b = self.nat_pred(s)?;
-        Some(self.def_eq_core(a, b))
+        let (Some(a), Some(b)) = (self.nat_pred(t), self.nat_pred(s)) else {
+            return Ok(None);
+        };
+        Ok(Some(self.def_eq_core(a, b)?))
     }
 
+    #[allow(clippy::type_complexity)]
     fn lazy_delta(
         &mut self,
         mut t: ExprPtr<'t>,
         mut s: ExprPtr<'t>,
-    ) -> Result<bool, (ExprPtr<'t>, ExprPtr<'t>)> {
+    ) -> R<Result<bool, (ExprPtr<'t>, ExprPtr<'t>)>> {
         loop {
-            if let Some(r) = self.offset(t, s) {
-                return Ok(r);
+            if let Some(r) = self.offset(t, s)? {
+                return Ok(Ok(r));
             }
             if !t.has_local() && !s.has_local() {
-                if let Some(tv) = self.reduce_nat(t) {
-                    return Ok(self.def_eq_core(tv, s));
+                if let Some(tv) = self.reduce_nat(t)? {
+                    return Ok(Ok(self.def_eq_core(tv, s)?));
                 }
-                if let Some(sv) = self.reduce_nat(s) {
-                    return Ok(self.def_eq_core(t, sv));
+                if let Some(sv) = self.reduce_nat(s)? {
+                    return Ok(Ok(self.def_eq_core(t, sv)?));
                 }
             }
             match (self.delta_hint(t), self.delta_hint(s)) {
-                (None, None) => return Err((t, s)),
-                (Some(_), None) => t = self.unfold_core(t),
-                (None, Some(_)) => s = self.unfold_core(s),
+                (None, None) => return Ok(Err((t, s))),
+                (Some(_), None) => t = self.unfold_core(t)?,
+                (None, Some(_)) => s = self.unfold_core(s)?,
                 (Some(ht), Some(hs)) => match unfold_order(ht, hs) {
-                    Ordering::Less => t = self.unfold_core(t),
-                    Ordering::Greater => s = self.unfold_core(s),
+                    Ordering::Less => t = self.unfold_core(t)?,
+                    Ordering::Greater => s = self.unfold_core(s)?,
                     Ordering::Equal => {
                         if let (Expr::App { .. }, Expr::App { .. }) = (*t, *s)
                             && matches!(ht, Hint::Regular(_))
-                            && self.same_const_head(t, s)
-                            && self.probe_args(t, s)
+                            && self.same_const_head(t, s)?
+                            && self.probe_args(t, s)?
                         {
-                            return Ok(true);
+                            return Ok(Ok(true));
                         }
-                        t = self.unfold_core(t);
-                        s = self.unfold_core(s);
+                        t = self.unfold_core(t)?;
+                        s = self.unfold_core(s)?;
                     }
                 },
             }
-            if let Some(r) = self.quick(t, s) {
-                return Ok(r);
+            if let Some(r) = self.quick(t, s)? {
+                return Ok(Ok(r));
             }
         }
     }
 
     #[inline]
-    fn same_const_head(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
+    fn same_const_head(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
         let (
             Expr::Const {
                 name: a,
@@ -397,12 +399,12 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             },
         ) = (*t.head(), *s.head())
         else {
-            return false;
+            return Ok(false);
         };
-        a == b && self.ctx.levels_eq(la, lb)
+        Ok(a == b && self.levels_eq(la, lb)?)
     }
 
-    fn unfold_core(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
+    fn unfold_core(&mut self, e: ExprPtr<'t>) -> R<ExprPtr<'t>> {
         let u = self.unfold(e).expect("delta hint without unfolding");
         self.whnf_core(u)
     }
@@ -433,39 +435,49 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         mask
     }
 
-    fn args_eq(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
+    fn args_eq(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
         let (head, ta) = self.ctx.unfold_apps(t);
         let (_, sa) = self.ctx.unfold_apps(s);
         if ta.len() != sa.len() {
-            return false;
+            return Ok(false);
         }
         let relevant = self.relevant_arguments(head, ta.len());
-        ta.iter()
-            .zip(&sa)
-            .enumerate()
-            .all(|(i, (&a, &b))| !relevant[i] || self.def_eq(a, b))
+        for (i, (&a, &b)) in ta.iter().zip(&sa).enumerate() {
+            if relevant[i] && !self.def_eq(a, b)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    fn def_eq_app(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
+    fn def_eq_app(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
         if !matches!(*t, Expr::App { .. })
             || !matches!(*s, Expr::App { .. })
             || t.num_args() != s.num_args()
         {
-            return false;
+            return Ok(false);
         }
         let (th, ta) = self.ctx.unfold_apps(t);
         let (sh, sa) = self.ctx.unfold_apps(s);
-        self.def_eq(th, sh) && ta.iter().zip(&sa).all(|(&a, &b)| self.def_eq(a, b))
+        if !self.def_eq(th, sh)? {
+            return Ok(false);
+        }
+        for (&a, &b) in ta.iter().zip(&sa) {
+            if !self.def_eq(a, b)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    fn eta(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
+    fn eta(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
         if !t.is_lambda() || s.is_lambda() {
-            return false;
+            return Ok(false);
         }
-        let st = self.infer(s, true);
-        let st = self.whnf(st);
+        let st = self.infer(s, true)?;
+        let st = self.whnf(st)?;
         let Expr::Pi { ty, .. } = *st else {
-            return false;
+            return Ok(false);
         };
         let v = self.ctx.var(0);
         let b = self.ctx.app(s, v);
@@ -473,52 +485,57 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         self.def_eq(t, l)
     }
 
-    fn eta_struct(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
+    fn eta_struct(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
         let Expr::Const { name, .. } = *s.head() else {
-            return false;
+            return Ok(false);
         };
         let Some(c) = self.struct_ctor(name, s.num_args()) else {
-            return false;
+            return Ok(false);
         };
-        let tt = self.infer(t, true);
-        let st = self.infer(s, true);
-        if !self.def_eq(tt, st) {
-            return false;
+        let tt = self.infer(t, true)?;
+        let st = self.infer(s, true)?;
+        if !self.def_eq(tt, st)? {
+            return Ok(false);
         }
         let (_, args) = self.ctx.unfold_apps(s);
-        (0..c.num_fields).all(|i| {
+        for i in 0..c.num_fields {
             let p = self.ctx.proj(c.induct, i, t);
-            self.def_eq(p, args[usize::from(c.num_params + i)])
-        })
+            if !self.def_eq(p, args[usize::from(c.num_params + i)])? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    fn string_expand(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> Option<bool> {
-        let of_list = self.names.string_of_list?;
+    fn string_expand(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<Option<bool>> {
+        let Some(of_list) = self.names.string_of_list else {
+            return Ok(None);
+        };
         if let Expr::StrLit { s: x, .. } = *t
             && s.head().const_name() == Some(of_list)
         {
-            let e = self.str_to_ctor(x);
-            return Some(self.def_eq_core(e, s));
+            let e = self.str_to_ctor(x)?;
+            return Ok(Some(self.def_eq_core(e, s)?));
         }
         if let Expr::StrLit { s: x, .. } = *s
             && t.head().const_name() == Some(of_list)
         {
-            let e = self.str_to_ctor(x);
-            return Some(self.def_eq_core(t, e));
+            let e = self.str_to_ctor(x)?;
+            return Ok(Some(self.def_eq_core(t, e)?));
         }
-        None
+        Ok(None)
     }
 
-    fn unit_like(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> bool {
-        let tt = self.infer(t, true);
-        let tt = self.whnf(tt);
+    fn unit_like(&mut self, t: ExprPtr<'t>, s: ExprPtr<'t>) -> R<bool> {
+        let tt = self.infer(t, true)?;
+        let tt = self.whnf(tt)?;
         let Expr::Const { name, .. } = *tt.head() else {
-            return false;
+            return Ok(false);
         };
         if !self.unit_struct(name) {
-            return false;
+            return Ok(false);
         }
-        let st = self.infer(s, true);
+        let st = self.infer(s, true)?;
         self.def_eq_core(tt, st)
     }
 }

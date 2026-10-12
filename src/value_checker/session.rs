@@ -8,7 +8,7 @@ use crate::term::arena::Arena;
 use crate::term::ctx::Ctx;
 use crate::term::decl::Declar;
 use crate::term::intern::Store;
-use crate::term::outcome::{self, Decline, Failure};
+use crate::term::outcome::{Decline, Failure};
 use std::mem::{replace, transmute};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -43,7 +43,7 @@ pub fn check<'a>(
         return checker::check_with_adapter(store, arena, idx, limits, adapter, native_only);
     }
     let mut vc = Vc::new(store, arena, limits);
-    let result = outcome::run(|| vc.check(idx));
+    let result = vc.check(idx);
     #[cfg(feature = "vstats")]
     vc.report_declaration(idx);
     let rest = Limits {
@@ -141,7 +141,7 @@ impl<'a> Session<'a> {
             // SAFETY: spare tables are empty.
             vc.t.absorb(unsafe { transmute::<Tables<'static>, Tables<'_>>(t) });
         }
-        let result = outcome::run(|| vc.check(idx));
+        let result = vc.check(idx);
         #[cfg(feature = "vstats")]
         TOTAL
             .lock()

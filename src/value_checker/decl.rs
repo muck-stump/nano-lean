@@ -5,40 +5,43 @@ use crate::ensure;
 use crate::term::ctx::Ctx;
 use crate::term::decl::Declar;
 use crate::term::expr::Expr;
-use crate::term::outcome::{self, Failure, raise};
+use crate::term::outcome::Failure;
 use crate::term::ptr::{ExprPtr, LevelPtr, LevelsPtr};
 use smallvec::SmallVec;
 use std::mem::swap;
 
-const PROBE_ESCAPED: &str = "probe exhaustion escaped its probe";
-
 impl<'t, 'a: 't> Vc<'t, 'a> {
-    pub(super) fn check(&mut self, idx: u32) {
-        self.ensure_arena();
+    pub(super) fn check(&mut self, idx: u32) -> Result<(), Failure> {
+        self.check_in(idx).map_err(|_| self.failure())
+    }
+
+    fn check_in(&mut self, idx: u32) -> R<()> {
+        self.ensure_arena()?;
         let d = self.ctx.store.declars[idx as usize];
         self.uparams = d.uparams();
         self.included.clear();
         self.limit = idx;
-        let r: R<()> = (|| {
-            match d {
-                Declar::Axiom(i) => {
-                    self.check_type(i.ty)?;
-                }
-                Declar::Def(i, v, _) | Declar::Opaque(i, v) => {
-                    self.check_telescope(i.ty)?;
-                    self.check_value(v, i.ty)?;
-                }
-                Declar::Thm(i, v) => {
-                    let l = self.check_telescope(i.ty)?;
-                    let z = self.ctx.zero();
-                    ensure!(self.ctx.level_eq(l, z), "theorem type is not a proposition");
-                    self.check_value(v, i.ty)?;
-                }
-                _ => unreachable!("bridged declaration"),
+        match d {
+            Declar::Axiom(i) => {
+                self.check_type(i.ty)?;
             }
-            Ok(())
-        })();
-        r.expect(PROBE_ESCAPED);
+            Declar::Def(i, v, _) | Declar::Opaque(i, v) => {
+                self.check_telescope(i.ty)?;
+                self.check_value(v, i.ty)?;
+            }
+            Declar::Thm(i, v) => {
+                let l = self.check_telescope(i.ty)?;
+                let z = self.ctx.zero();
+                ensure!(
+                    self,
+                    self.level_eq(l, z)?,
+                    "theorem type is not a proposition"
+                );
+                self.check_value(v, i.ty)?;
+            }
+            _ => unreachable!("bridged declaration"),
+        }
+        Ok(())
     }
 
     fn check_type(&mut self, ty: ExprPtr<'t>) -> R<LevelPtr<'t>> {
@@ -116,10 +119,10 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         let vt = self.infer(env, id, v, false)?;
         for (dom, env, b) in doms {
             let d = self.eval(env, id, b)?;
-            ensure!(self.def_eq(dom, d)?, "declaration type mismatch");
+            ensure!(self, self.def_eq(dom, d)?, "declaration type mismatch");
         }
         let tv = self.eval(env, id, ty)?;
-        ensure!(self.def_eq(vt, tv)?, "declaration type mismatch");
+        ensure!(self, self.def_eq(vt, tv)?, "declaration type mismatch");
         Ok(())
     }
 }
@@ -143,17 +146,25 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                 if ty != want {
                     let a = self.eval(Env::EMPTY, id, ty)?;
                     let b = self.eval(Env::EMPTY, id, want)?;
-                    ensure!(self.def_eq(a, b)?, "incorrect recursor type");
+                    ensure!(self, self.def_eq(a, b)?, "incorrect recursor type");
                 }
             }
             RecCheck::Rule(rhs, want) => {
                 let wt = self.infer(Env::EMPTY, id, want, false)?;
                 if rhs != want {
                     let at = self.infer(Env::EMPTY, id, rhs, false)?;
-                    ensure!(self.def_eq(at, wt)?, "incorrect recursor computation rule");
+                    ensure!(
+                        self,
+                        self.def_eq(at, wt)?,
+                        "incorrect recursor computation rule"
+                    );
                     let a = self.eval(Env::EMPTY, id, rhs)?;
                     let b = self.eval(Env::EMPTY, id, want)?;
-                    ensure!(self.def_eq(a, b)?, "incorrect recursor computation rule");
+                    ensure!(
+                        self,
+                        self.def_eq(a, b)?,
+                        "incorrect recursor computation rule"
+                    );
                 }
             }
         }
@@ -168,7 +179,7 @@ pub(crate) fn check_recursor<'t, 'a: 't>(
     uparams: LevelsPtr<'t>,
     limit: u32,
     checks: &[RecCheck<'t>],
-) -> Result<(), usize> {
+) -> Result<Option<usize>, Failure> {
     let mut vc = Vc::new(ctx.store, ctx.arena, limits);
     swap(&mut vc.ctx, ctx);
     let e = vc.ctx.levels(&[]);
@@ -177,18 +188,19 @@ pub(crate) fn check_recursor<'t, 'a: 't>(
     vc.uparams = uparams;
     vc.limit = limit;
     let mut at = 0;
-    let result = outcome::run(|| {
-        for (i, &c) in checks.iter().enumerate() {
+    let result = checks
+        .iter()
+        .enumerate()
+        .try_for_each(|(i, &c)| {
             at = i;
-            vc.rec_check(c).expect(PROBE_ESCAPED);
-        }
-    });
+            vc.rec_check(c)
+        })
+        .map_err(|_| vc.failure());
     swap(&mut vc.ctx, ctx);
     *steps = vc.steps_left;
     match result {
-        Ok(()) => Ok(()),
-        Err(Failure::Rejected(_)) => Err(at),
-        Err(Failure::Declined(d)) => raise(d),
-        Err(Failure::Internal(m)) => raise(m),
+        Ok(()) => Ok(None),
+        Err(Failure::Rejected(_)) => Ok(Some(at)),
+        Err(failure) => Err(failure),
     }
 }

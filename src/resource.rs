@@ -1,5 +1,4 @@
 use crate::kernel::Error;
-use crate::term::outcome::{Decline, raise};
 use std::fmt;
 
 const STACK_RED_ZONE: usize = 1 << 20;
@@ -64,12 +63,6 @@ impl Budget {
             Self::NestedExpansion => "checking budget exhausted during nested expansion",
             Self::UniverseComparison => "universe comparison budget exhausted",
         }
-    }
-
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn decline(self) -> ! {
-        raise(Decline::Exhausted(self))
     }
 }
 

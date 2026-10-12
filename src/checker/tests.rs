@@ -1,7 +1,6 @@
 use super::*;
 use crate::import::import_bytes;
 use crate::mutate::render;
-use crate::term::outcome;
 use std::io::Cursor;
 
 const FOUNDATIONS: &[u8] = include_bytes!("../../tests/fixtures/foundations.ndjson");
@@ -106,9 +105,9 @@ fn a_reused_checker_cannot_reuse_types_or_unfoldings_from_a_later_scope() {
     tc.limit = store.declars.len() as u32;
     let levels = tc.empty_levels();
     let g = tc.ctx.konst(store.declars[3].name(), levels);
-    tc.infer(g, false);
+    tc.infer(g, false).unwrap();
     assert!(tc.unfold(g).is_some());
-    let failure = outcome::run(|| tc.check(2)).expect_err("forward reference accepted");
+    let failure = tc.check(2).expect_err("forward reference accepted");
     assert!(failure.reason().contains("unknown constant"));
     assert!(tc.unfold(g).is_none());
 }
@@ -126,14 +125,14 @@ fn proposition_detection_compares_universes_semantically() {
     let imax = tc.ctx.imax(u, zero);
     let sort = tc.ctx.sort(imax);
     let proposition = tc.fresh_local(sort);
-    assert!(tc.is_prop(proposition));
+    assert!(tc.is_prop(proposition).unwrap());
     let sort = tc.ctx.sort(u);
     let unknown = tc.fresh_local(sort);
-    assert!(!tc.is_prop(unknown));
+    assert!(!tc.is_prop(unknown).unwrap());
     let one = tc.ctx.succ(zero);
     let sort = tc.ctx.sort(one);
     let data = tc.fresh_local(sort);
-    assert!(!tc.is_prop(data));
+    assert!(!tc.is_prop(data).unwrap());
 }
 
 #[test]
@@ -176,30 +175,33 @@ fn failed_and_exhausted_congruence_probes_fall_back_to_unfolding() {
             })
             .unwrap()
     };
-    assert!(tc.def_eq(body("PhaseTwo.erasedCostly"), body("PhaseTwo.erasedOne")));
+    assert!(
+        tc.def_eq(body("PhaseTwo.erasedCostly"), body("PhaseTwo.erasedOne"))
+            .unwrap()
+    );
     assert!(tc.probe_remaining.is_none());
     assert_eq!(
         tc.probe_exhaustions, 0,
         "unused arguments need no reduction"
     );
     let (_, arguments) = tc.ctx.unfold_apps(body("PhaseTwo.erasedCostly"));
-    let succ = tc.konst0(tc.names.nat_succ);
+    let succ = tc.konst0(tc.names.nat_succ).unwrap();
     let costly = tc.ctx.app(succ, arguments[0]);
     let one = tc.ctx.nat_lit(1u32.into());
     let cheap = tc.ctx.app(succ, one);
-    assert!(!tc.probe_args(costly, cheap));
+    assert!(!tc.probe_args(costly, cheap).unwrap());
     assert!(tc.probe_exhaustions > 0);
     assert!(tc.probe_remaining.is_none());
     let exhausted = tc.probe_exhaustions;
     let remaining = tc.steps_left;
-    assert!(!tc.probe_args(costly, cheap));
-    assert!(!tc.probe_args(cheap, costly));
+    assert!(!tc.probe_args(costly, cheap).unwrap());
+    assert!(!tc.probe_args(cheap, costly).unwrap());
     assert_eq!(tc.probe_exhaustions, exhausted);
     assert_eq!(tc.steps_left, remaining);
     let two = tc.ctx.nat_lit(2u32.into());
     tc.fail_cache.insert((cheap, two));
-    assert!(tc.def_eq(cheap, two));
-    assert!(!tc.def_eq(one, two));
+    assert!(tc.def_eq(cheap, two).unwrap());
+    assert!(!tc.def_eq(one, two).unwrap());
     assert!(local.allocated_bytes() < 2 << 20);
 }
 
@@ -224,11 +226,11 @@ fn rigid_congruence_does_not_repeat_exhausted_speculation() {
     let (rec, mut arguments) = tc.ctx.unfold_apps(arguments[0]);
     *arguments.last_mut().unwrap() = tc.ctx.nat_lit(512u32.into());
     let computation = tc.ctx.apps(rec, &arguments);
-    let succ = tc.konst0(tc.names.nat_succ);
+    let succ = tc.konst0(tc.names.nat_succ).unwrap();
     let left = tc.ctx.app(succ, computation);
     let zero = tc.ctx.nat_lit(0u32.into());
     let right = tc.ctx.app(succ, zero);
-    assert!(tc.def_eq(left, right));
+    assert!(tc.def_eq(left, right).unwrap());
     assert_eq!(tc.probe_exhaustions, 0);
     assert!(tc.fail_cache.is_empty());
 }
@@ -254,8 +256,7 @@ fn projections_expose_operations_before_expensive_natural_reduction() {
     let projected = body("PhaseTwo.projected");
     // A wrong reduction order walks billions of successors, so this must fail, not hang.
     tc.probe_remaining = Some(10_000);
-    outcome::run(|| assert!(tc.def_eq(direct, projected)))
-        .unwrap_or_else(|e| panic!("{}", e.reason()));
+    assert!(tc.def_eq(direct, projected).unwrap());
     assert!(local.allocated_bytes() < 1 << 20);
 }
 
@@ -264,19 +265,19 @@ fn resource_exhaustion_is_unsupported_and_the_next_check_can_proceed() {
     let arena = Arena::new();
     let store = import_bytes(&arena, REDUCTION).unwrap();
     let mut local = Arena::new();
-    let failure = outcome::run(|| {
-        Tc::new(&store, &local)
-            .with_limits(Limits {
-                steps: 0,
-                arena_bytes: 1 << 20,
-            })
-            .check(0);
-    })
-    .expect_err("zero budget must not succeed");
+    let failure = Tc::new(&store, &local)
+        .with_limits(Limits {
+            steps: 0,
+            arena_bytes: 1 << 20,
+        })
+        .check(0)
+        .expect_err("zero budget must not succeed");
     assert_eq!(failure.status(), "unsupported");
     assert_eq!(failure.exit_code(), 2);
     local.reset();
-    outcome::run(|| Tc::new(&store, &local).check(0)).unwrap_or_else(|e| panic!("{}", e.reason()));
+    Tc::new(&store, &local)
+        .check(0)
+        .unwrap_or_else(|e| panic!("{}", e.reason()));
 }
 
 #[test]
@@ -384,7 +385,7 @@ fn universe_equivalence_agrees_with_existing_kernel() {
     for (a, old_a) in &levels {
         for (b, old_b) in &levels {
             assert_eq!(
-                tc.ctx.level_eq(*a, *b),
+                tc.ctx.try_level_eq(*a, *b).unwrap(),
                 old_a.equivalent(old_b).unwrap(),
                 "{old_a:?} == {old_b:?}"
             );
@@ -403,20 +404,16 @@ fn fallback_cannot_accept_an_invalid_body_or_restore_an_exhausted_budget() {
         .iter()
         .position(|d| d.name().to_string() == "f")
         .unwrap() as u32;
-    assert!(outcome::run(|| Tc::new(&store, &local).check_existing(index)).is_err());
+    assert!(Tc::new(&store, &local).check_existing(index).is_err());
     let arena = Arena::new();
     let store = import_bytes(&arena, REDUCTION).unwrap();
     let local = Arena::new();
-    let failure = outcome::run(|| {
-        Tc::new(&store, &local)
-            .with_limits(Limits {
-                steps: 0,
-                arena_bytes: 1,
-            })
-            .check_existing(0);
-    })
-    .err()
-    .unwrap();
+    let mut tc = Tc::new(&store, &local).with_limits(Limits {
+        steps: 0,
+        arena_bytes: 1,
+    });
+    assert!(tc.check_existing(0).is_err());
+    let failure = tc.failure();
     assert_eq!(failure.status(), "unsupported");
 }
 
@@ -478,12 +475,12 @@ fn contextual_inference_keeps_distinct_local_types_and_dependencies() {
     let type_identity = tc.ctx.lam(ty, variable);
     let prop_expected = tc.ctx.pi(prop, prop);
     let type_expected = tc.ctx.pi(ty, ty);
-    assert_eq!(tc.infer(prop_identity, false), prop_expected);
-    assert_eq!(tc.infer(type_identity, false), type_expected);
+    assert_eq!(tc.infer(prop_identity, false).unwrap(), prop_expected);
+    assert_eq!(tc.infer(type_identity, false).unwrap(), type_expected);
     let outer = tc.ctx.var(1);
     let inner = tc.ctx.lam(prop, outer);
     let dependent = tc.ctx.lam(ty, inner);
-    let result = tc.infer(dependent, false);
+    let result = tc.infer(dependent, false).unwrap();
     let inner_expected = tc.ctx.pi(prop, ty);
     let expected = tc.ctx.pi(ty, inner_expected);
     assert_eq!(result, expected);
@@ -499,7 +496,7 @@ fn beta_and_let_ladders_do_not_copy_remaining_bodies() {
             let local = Arena::new();
             let mut tc = Tc::new(&store, &local);
             tc.limit = store.declars.len() as u32;
-            let nat = tc.konst0(tc.names.nat);
+            let nat = tc.konst0(tc.names.nat).unwrap();
             let zero = tc.ctx.nat_lit(0u32.into());
             let variable = tc.ctx.var(0);
             let mut beta = variable;
@@ -509,15 +506,15 @@ fn beta_and_let_ladders_do_not_copy_remaining_bodies() {
             }
             let lam = tc.ctx.lam(nat, beta);
             let term = tc.ctx.app(lam, zero);
-            assert_eq!(tc.infer(term, false), nat);
-            assert_eq!(tc.whnf(term), zero);
+            assert_eq!(tc.infer(term, false).unwrap(), nat);
+            assert_eq!(tc.whnf(term).unwrap(), zero);
             let mut lets = variable;
             for _ in 0..1024 {
                 lets = tc.ctx.let_(nat, variable, lets, false);
             }
             let lets = tc.ctx.let_(nat, zero, lets, false);
-            assert_eq!(tc.infer(lets, false), nat);
-            assert_eq!(tc.whnf(lets), zero);
+            assert_eq!(tc.infer(lets, false).unwrap(), nat);
+            assert_eq!(tc.whnf(lets).unwrap(), zero);
             assert!(local.allocated_bytes() < 2 << 20);
         })
         .unwrap()
@@ -556,7 +553,7 @@ fn conversion_locals_share_work_without_aliasing_nested_binders() {
     let local = Arena::new();
     let mut tc = Tc::new(&store, &local);
     tc.limit = store.declars.len() as u32;
-    let nat = tc.konst0(tc.names.nat);
+    let nat = tc.konst0(tc.names.nat).unwrap();
     let inner = tc.ctx.var(0);
     let outer = tc.ctx.var(1);
     let left = tc.ctx.lam(nat, outer);
@@ -564,21 +561,19 @@ fn conversion_locals_share_work_without_aliasing_nested_binders() {
     let right = tc.ctx.lam(nat, inner);
     let right = tc.ctx.lam(nat, right);
     for _ in 0..4 {
-        assert!(!tc.def_eq(left, right));
+        assert!(!tc.def_eq(left, right).unwrap());
         assert_eq!(tc.conversion_depth.get(), 0);
     }
     let slots = tc.conversion_locals.len();
     assert!(slots >= 2);
-    assert!(!tc.def_eq(left, right));
+    assert!(!tc.def_eq(left, right).unwrap());
     assert_eq!(tc.conversion_locals.len(), slots);
     tc.probe_remaining = Some(1);
-    let exhausted =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tc.def_eq(left, right)))
-            .unwrap_err();
-    assert!(exhausted.is::<crate::term::outcome::ProbeExhausted>());
+    assert!(tc.def_eq(left, right).is_err());
+    assert!(tc.fail.is_none());
     tc.probe_remaining = None;
     assert_eq!(tc.conversion_depth.get(), 0);
-    assert!(!tc.def_eq(left, right));
+    assert!(!tc.def_eq(left, right).unwrap());
 }
 
 #[test]
@@ -588,20 +583,20 @@ fn repeated_conversion_does_not_copy_bodies_under_fresh_local_names() {
     let local = Arena::new();
     let mut tc = Tc::new(&store, &local);
     tc.limit = store.declars.len() as u32;
-    let nat = tc.konst0(tc.names.nat);
-    let succ = tc.konst0(tc.names.nat_succ);
+    let nat = tc.konst0(tc.names.nat).unwrap();
+    let succ = tc.konst0(tc.names.nat_succ).unwrap();
     let var = tc.ctx.var(0);
     let lhs_body = tc.ctx.app(succ, var);
     let lhs = tc.ctx.lam(nat, lhs_body);
     let identity = tc.ctx.lam(nat, var);
     let rhs_body = tc.ctx.app(identity, lhs_body);
     let rhs = tc.ctx.lam(nat, rhs_body);
-    assert!(tc.def_eq(lhs, rhs));
+    assert!(tc.def_eq(lhs, rhs).unwrap());
     let nodes = tc.ctx.dag.exprs.len();
     for _ in 0..64 {
         tc.eq_cache.remove(&(lhs, rhs));
         tc.eq_cache.remove(&(rhs, lhs));
-        assert!(tc.def_eq(lhs, rhs));
+        assert!(tc.def_eq(lhs, rhs).unwrap());
     }
     assert!(
         tc.ctx.dag.exprs.len() <= nodes + 8,

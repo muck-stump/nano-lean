@@ -21,12 +21,15 @@ use crate::term::ctx::Ctx;
 use crate::term::decl::Declar;
 use crate::term::intern::{Names, Store};
 use crate::term::level::Level;
+use crate::term::ops::LEVEL_FORM;
+use crate::term::outcome::{Decline, Failure, R, Stop};
 use crate::term::ptr::{LevelPtr, LevelsPtr, NamePtr};
 use crate::{ensure, reject};
 use smallvec::SmallVec;
 #[cfg(feature = "vstats")]
 use stats::Stats;
 use stats::stat;
+use std::fmt;
 use std::mem::{take, transmute};
 use tables::{POOL, Tables};
 use value::{Head, K, Sub, V, Val};
@@ -38,11 +41,6 @@ pub use stats::{RESETS, TOTAL, report};
 
 const ARENA_STRIDE_MASK: u64 = 1023;
 const INCLUDED_MAX: usize = 8;
-
-/// Probe budget ran out, never a semantic answer.
-#[derive(Debug)]
-pub struct Stop;
-pub type R<T> = Result<T, Stop>;
 
 struct Vc<'t, 'a: 't> {
     pub ctx: Ctx<'t, 'a>,
@@ -62,6 +60,7 @@ struct Vc<'t, 'a: 't> {
     t: Tables<'t>,
     base: usize,
     floor: usize,
+    fail: Option<Failure>,
     #[cfg(feature = "vstats")]
     pub stats: Stats,
     #[cfg(feature = "vstats")]
@@ -106,6 +105,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                 }),
             base: arena.allocated_bytes(),
             floor: stack_floor(),
+            fail: None,
             #[cfg(feature = "vstats")]
             stats: Stats::default(),
             #[cfg(feature = "vstats")]
@@ -117,32 +117,38 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         self.ctx.arena.allocated_bytes() - self.base
     }
 
-    #[inline(always)]
-    fn guard(&self) {
-        if stack_exhausted(self.floor) {
-            Budget::Stack.decline();
-        }
-    }
-
-    fn ensure_arena(&self) {
-        if self.used() > self.limits.arena_bytes {
-            Budget::Arena.decline();
-        }
-    }
-
-    #[inline]
-    pub(crate) fn work(&mut self) {
-        if self.steps_left & ARENA_STRIDE_MASK >= 2 {
-            self.steps_left -= 1;
-        } else {
-            self.work_slow();
-        }
+    #[cold]
+    #[inline(never)]
+    fn reject(&mut self, msg: fmt::Arguments<'_>) -> Stop {
+        self.fail = Some(Failure::Rejected(msg.to_string()));
+        Stop
     }
 
     #[cold]
     #[inline(never)]
-    fn work_slow(&mut self) {
-        self.spend_slow();
+    fn decline(&mut self, budget: Budget) -> Stop {
+        self.fail = Some(Failure::Declined(Decline::Exhausted(budget)));
+        Stop
+    }
+
+    /// The failure behind a `Stop` that reached the top of the check.
+    fn failure(&mut self) -> Failure {
+        Failure::escaped(&mut self.fail)
+    }
+
+    #[inline(always)]
+    fn guard(&mut self) -> R<()> {
+        if stack_exhausted(self.floor) {
+            return Err(self.decline(Budget::Stack));
+        }
+        Ok(())
+    }
+
+    fn ensure_arena(&mut self) -> R<()> {
+        if self.used() > self.limits.arena_bytes {
+            return Err(self.decline(Budget::Arena));
+        }
+        Ok(())
     }
 
     #[inline]
@@ -156,19 +162,28 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
 
     #[inline(never)]
     fn tick_slow(&mut self) -> R<()> {
-        self.spend_slow();
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn spend_slow(&mut self) {
         if self.steps_left == 0 {
-            Budget::Work.decline();
+            return Err(self.decline(Budget::Work));
         }
         self.steps_left -= 1;
         if self.steps_left & ARENA_STRIDE_MASK == 0 {
-            self.ensure_arena();
+            self.ensure_arena()?;
         }
+        Ok(())
+    }
+
+    fn level_eq(&mut self, a: LevelPtr<'t>, b: LevelPtr<'t>) -> R<bool> {
+        let Some(r) = self.ctx.try_level_eq(a, b) else {
+            reject!(self, "{LEVEL_FORM}")
+        };
+        Ok(r)
+    }
+
+    fn levels_eq(&mut self, a: LevelsPtr<'t>, b: LevelsPtr<'t>) -> R<bool> {
+        let Some(r) = self.ctx.try_levels_eq(a, b) else {
+            reject!(self, "{LEVEL_FORM}")
+        };
+        Ok(r)
     }
 
     pub(crate) fn sub(&self, ks: LevelsPtr<'t>, vs: LevelsPtr<'t>) -> Sub<'t> {
@@ -190,12 +205,12 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         })
     }
 
-    pub(crate) fn konst0(&mut self, n: Option<NamePtr<'t>>) -> V<'t> {
+    pub(crate) fn konst0(&mut self, n: Option<NamePtr<'t>>) -> R<V<'t>> {
         let Some(n) = n else {
-            reject!("missing builtin constant")
+            reject!(self, "missing builtin constant")
         };
         let e = self.ctx.levels(&[]);
-        self.mk(K::Neu(Head::Const(n, e), &[]), false)
+        Ok(self.mk(K::Neu(Head::Const(n, e), &[]), false))
     }
 
     fn within(&mut self, ls: LevelsPtr<'t>) -> bool {
@@ -212,7 +227,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         ok
     }
 
-    fn check_level(&mut self, l: LevelPtr<'t>) {
+    fn check_level(&mut self, l: LevelPtr<'t>) -> R<()> {
         fn has_param(l: LevelPtr<'_>) -> bool {
             match *l {
                 Level::Zero => false,
@@ -223,8 +238,13 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         }
         if has_param(l) {
             self.scoped += 1;
-            ensure!(l.params_in(self.uparams), "undeclared universe parameter");
+            ensure!(
+                self,
+                l.params_in(self.uparams),
+                "undeclared universe parameter"
+            );
         }
+        Ok(())
     }
 }
 

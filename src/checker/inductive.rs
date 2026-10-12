@@ -10,9 +10,10 @@ use crate::term::expr::Expr;
 use crate::term::intern::{Block, Store};
 use crate::term::level::Level;
 use crate::term::name::Name;
+use crate::term::outcome::{Decline, Failure, R};
 use crate::term::ptr::{ExprPtr, LevelPtr, LevelsPtr, NamePtr};
 use crate::term::{FxHashMap, FxHashSet};
-use crate::{ensure, reject, unsupported};
+use crate::{ensure, reject};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::ptr;
@@ -57,7 +58,7 @@ impl Drop for BlockTimer {
 }
 
 impl<'t, 'a: 't> Tc<'t, 'a> {
-    pub(crate) fn check_inductive(&mut self, idx: u32, d: Declar<'t>) {
+    pub(crate) fn check_inductive(&mut self, idx: u32, d: Declar<'t>) -> R<()> {
         let block = *self
             .ctx
             .store
@@ -65,19 +66,19 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             .get(&d.name())
             .expect("imported block");
         if block.start != idx {
-            return;
+            return Ok(());
         }
         let native = self.native_block(block);
         #[cfg(feature = "vstats")]
         let _timer = BlockTimer(usize::from(!native), Instant::now());
         if native {
-            self.check_block(block);
+            self.check_block(block)
         } else {
-            self.check_existing(idx);
+            self.check_existing(idx)
         }
     }
 
-    pub(super) fn check_existing(&mut self, idx: u32) {
+    pub(super) fn check_existing(&mut self, idx: u32) -> R<()> {
         let d = self.ctx.store.declars[idx as usize];
         let block = self
             .ctx
@@ -98,51 +99,32 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             );
             adapter.session.begin(idx);
         }
-        let dependencies = self.inductive_dependencies(block);
+        let dependencies = self.inductive_dependencies(block)?;
         let theorem = matches!(d, Declar::Thm(..));
         if let Some(adapter) = self.adapter.as_mut() {
-            let prefix: Vec<_> = dependencies
-                .into_iter()
-                .map(|index| {
-                    let dependency = adapter.store.declars[index as usize];
-                    (
-                        index,
-                        adapter
-                            .convert
-                            .declaration(adapter.store, dependency, false),
-                    )
-                })
-                .collect();
-            let target = adapter.convert.declaration(
-                adapter.store,
-                adapter.store.declars[idx as usize],
-                true,
-            );
-            let result = with_work(&mut self.steps_left, |work| {
-                adapter.session.validate(prefix, target, theorem, work)
-            });
-            if adapter.convert.expressions.len() > CONVERT_CACHE_LIMIT {
-                adapter.convert = Convert::new();
-            }
-            return accept(result);
+            let result = bridged(adapter, dependencies, idx, theorem, &mut self.steps_left);
+            return result.map_err(|f| self.failed(f));
         }
         let mut convert = Convert::new();
         let store = self.ctx.store;
-        let prefix: Vec<_> = dependencies
-            .into_iter()
-            .map(|index| {
-                self.tick();
-                convert.declaration(store, store.declars[index as usize], false)
-            })
-            .collect();
-        let target = convert.declaration(store, d, true);
+        let mut prefix = Vec::with_capacity(dependencies.len());
+        for index in dependencies {
+            self.tick()?;
+            let dependency = convert
+                .declaration(store, store.declars[index as usize], false)
+                .map_err(|f| self.failed(f))?;
+            prefix.push(dependency);
+        }
+        let target = convert
+            .declaration(store, d, true)
+            .map_err(|f| self.failed(f))?;
         let result = with_work(&mut self.steps_left, |work| {
             validate_export_dependencies(prefix, target, theorem, work)
         });
-        accept(result);
+        accept(result).map_err(|f| self.failed(f))
     }
 
-    fn inductive_dependencies(&mut self, target: Block) -> BTreeSet<u32> {
+    fn inductive_dependencies(&mut self, target: Block) -> R<BTreeSet<u32>> {
         let store = self.ctx.store;
         let mut declarations = Vec::new();
         let mut expressions = Vec::new();
@@ -153,7 +135,7 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
         }
         loop {
             while let Some(e) = expressions.pop() {
-                self.tick();
+                self.tick()?;
                 if !seen.insert(e) {
                     continue;
                 }
@@ -187,10 +169,14 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
             let Some(name) = declarations.pop() else {
                 break;
             };
-            let index = name
-                .decl_idx()
-                .unwrap_or_else(|| reject!("unknown dependency {name}"));
-            ensure!(index < target.end, "inductive dependency is out of scope");
+            let Some(index) = name.decl_idx() else {
+                reject!(self, "unknown dependency {name}")
+            };
+            ensure!(
+                self,
+                index < target.end,
+                "inductive dependency is out of scope"
+            );
             if index >= target.start {
                 continue;
             }
@@ -221,8 +207,34 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                 }
             }
         }
-        needed
+        Ok(needed)
     }
+}
+
+fn bridged<'a>(
+    adapter: &mut Adapter<'a>,
+    dependencies: BTreeSet<u32>,
+    idx: u32,
+    theorem: bool,
+    steps_left: &mut u64,
+) -> Result<(), Failure> {
+    let store = adapter.store;
+    let mut prefix = Vec::with_capacity(dependencies.len());
+    for index in dependencies {
+        let dependency = store.declars[index as usize];
+        let converted = adapter.convert.declaration(store, dependency, false)?;
+        prefix.push((index, converted));
+    }
+    let target = adapter
+        .convert
+        .declaration(store, store.declars[idx as usize], true)?;
+    let result = with_work(steps_left, |work| {
+        adapter.session.validate(prefix, target, theorem, work)
+    });
+    if adapter.convert.expressions.len() > CONVERT_CACHE_LIMIT {
+        adapter.convert = Convert::new();
+    }
+    accept(result)
 }
 
 fn with_work(
@@ -235,11 +247,15 @@ fn with_work(
     result
 }
 
-fn accept(result: Result<(), kernel::Error>) {
+fn accept(result: Result<(), kernel::Error>) -> Result<(), Failure> {
     match result {
-        Ok(()) => {}
-        Err(error @ kernel::Error::Rejected(_)) => reject!("declaration validation: {error}"),
-        Err(error) => unsupported!("validation: {error}"),
+        Ok(()) => Ok(()),
+        Err(error @ kernel::Error::Rejected(_)) => Err(Failure::Rejected(format!(
+            "declaration validation: {error}"
+        ))),
+        Err(error) => Err(Failure::Declined(Decline::Unsupported(format!(
+            "validation: {error}"
+        )))),
     }
 }
 
@@ -274,33 +290,41 @@ impl<'a> Convert<'a> {
         }
     }
 
-    fn declaration(&mut self, store: &Store<'a>, d: Declar<'a>, target: bool) -> ExportDependency {
-        match d {
+    fn declaration(
+        &mut self,
+        store: &Store<'a>,
+        d: Declar<'a>,
+        target: bool,
+    ) -> Result<ExportDependency, Failure> {
+        Ok(match d {
             Declar::Ind(_) | Declar::Ctor(_) | Declar::Rec(_) => {
-                ExportDependency::Inductive(self.block(store, store.blocks[&d.name()]))
+                ExportDependency::Inductive(self.block(store, store.blocks[&d.name()])?)
             }
             Declar::Quot(info) => ExportDependency::Quotient {
                 name: self.name(info.name),
-                params: self.params(info.uparams),
-                ty: (*self.expr(info.ty)).clone(),
+                params: self.params(info.uparams)?,
+                ty: (*self.expr(info.ty)?).clone(),
                 kind: match Some(info.name) {
                     n if n == store.names.quot => "type",
                     n if n == store.names.quot_mk => "ctor",
                     n if n == store.names.quot_lift => "lift",
                     n if n == store.names.quot_ind => "ind",
-                    _ => reject!("invalid quotient dependency"),
+                    _ => return Err(rejected("invalid quotient dependency")),
                 },
             },
             _ => ExportDependency::Ordinary {
                 name: self.name(d.name()),
-                params: self.params(d.uparams()),
-                ty: (*self.expr(d.ty())).clone(),
+                params: self.params(d.uparams())?,
+                ty: (*self.expr(d.ty())?).clone(),
                 value: match d {
-                    Declar::Opaque(_, v) if target => Some((*self.expr(v)).clone()),
-                    _ => d.unfoldable().map(|(v, _)| (*self.expr(v)).clone()),
+                    Declar::Opaque(_, v) if target => Some((*self.expr(v)?).clone()),
+                    _ => match d.unfoldable() {
+                        Some((v, _)) => Some((*self.expr(v)?).clone()),
+                        None => None,
+                    },
                 },
             },
-        }
+        })
     }
 
     fn name(&mut self, name: NamePtr<'a>) -> String {
@@ -328,70 +352,76 @@ impl<'a> Convert<'a> {
             .clone()
     }
 
-    fn level(&mut self, l: LevelPtr<'a>) -> KernelLevel {
+    fn level(&mut self, l: LevelPtr<'a>) -> Result<KernelLevel, Failure> {
         if let Some(v) = self.levels.get(&l) {
-            return v.clone();
+            return Ok(v.clone());
         }
         let v = match *l {
             Level::Zero => KernelLevel::Nat(0),
             Level::Param(n, _) => KernelLevel::Param(self.name(n)),
-            Level::Succ(l, _) => self.level(l).succ().unwrap_or_else(|e| reject!("{e}")),
-            Level::Max(a, b, _) => KernelLevel::max(self.level(a), self.level(b)),
-            Level::IMax(a, b, _) => KernelLevel::imax(self.level(a), self.level(b)),
+            Level::Succ(l, _) => self
+                .level(l)?
+                .succ()
+                .map_err(|e| rejected(&e.to_string()))?,
+            Level::Max(a, b, _) => KernelLevel::max(self.level(a)?, self.level(b)?),
+            Level::IMax(a, b, _) => KernelLevel::imax(self.level(a)?, self.level(b)?),
         };
         self.levels.insert(l, v.clone());
-        v
+        Ok(v)
     }
 
-    fn params(&mut self, levels: LevelsPtr<'a>) -> Vec<String> {
+    fn params(&mut self, levels: LevelsPtr<'a>) -> Result<Vec<String>, Failure> {
         levels
             .iter()
             .map(|l| match **l {
-                Level::Param(n, _) => self.name(n),
-                _ => reject!("invalid universe parameter"),
+                Level::Param(n, _) => Ok(self.name(n)),
+                _ => Err(rejected("invalid universe parameter")),
             })
             .collect()
     }
 
-    fn expr(&mut self, e: ExprPtr<'a>) -> Shared<KernelExpr> {
+    fn expr(&mut self, e: ExprPtr<'a>) -> Result<Shared<KernelExpr>, Failure> {
         if let Some(v) = self.expressions.get(&e) {
-            return v.clone();
+            return Ok(v.clone());
         }
         if stack_exhausted(self.floor) {
-            Budget::Stack.decline();
+            return Err(Failure::Declined(Decline::Exhausted(Budget::Stack)));
         }
         let out = match *e {
             Expr::Var { idx, .. } => KernelExpr::Var(KernelName::bound(usize::from(idx), 0)),
-            Expr::Sort { level, .. } => KernelExpr::Sort(self.level(level)),
+            Expr::Sort { level, .. } => KernelExpr::Sort(self.level(level)?),
             Expr::Const { name, levels, .. } => KernelExpr::Const(
                 self.name(name),
-                levels.iter().map(|l| self.level(*l)).collect(),
+                levels
+                    .iter()
+                    .map(|l| self.level(*l))
+                    .collect::<Result<_, _>>()?,
             ),
-            Expr::App { fun, arg, .. } => KernelExpr::App(self.expr(fun), self.expr(arg)),
+            Expr::App { fun, arg, .. } => KernelExpr::App(self.expr(fun)?, self.expr(arg)?),
             Expr::Lam { ty, body, .. } => {
-                KernelExpr::Lam(self.expr(ty), bind(KernelName::new("x"), self.expr(body)))
+                KernelExpr::Lam(self.expr(ty)?, bind(KernelName::new("x"), self.expr(body)?))
             }
             Expr::Pi { ty, body, .. } => {
-                KernelExpr::Pi(self.expr(ty), bind(KernelName::new("x"), self.expr(body)))
+                KernelExpr::Pi(self.expr(ty)?, bind(KernelName::new("x"), self.expr(body)?))
             }
             Expr::Let { data, .. } => KernelExpr::Let(
-                self.expr(data.ty),
-                self.expr(data.val),
-                bind(KernelName::new("x"), self.expr(data.body)),
+                self.expr(data.ty)?,
+                self.expr(data.val)?,
+                bind(KernelName::new("x"), self.expr(data.body)?),
             ),
             Expr::Proj { name, idx, e, .. } => {
-                KernelExpr::Proj(self.name(name), usize::from(idx), self.expr(e))
+                KernelExpr::Proj(self.name(name), usize::from(idx), self.expr(e)?)
             }
             Expr::NatLit { n, .. } => KernelExpr::nat(n.as_ref().clone()),
             Expr::StrLit { s, .. } => KernelExpr::Str(s.s.into()),
-            Expr::Local { .. } => reject!("local in imported inductive declaration"),
+            Expr::Local { .. } => return Err(rejected("local in imported inductive declaration")),
         };
         let out = Shared::new(out);
         self.expressions.insert(e, out.clone());
-        out
+        Ok(out)
     }
 
-    fn block(&mut self, store: &Store<'a>, b: Block) -> kernel::InductiveBlock {
+    fn block(&mut self, store: &Store<'a>, b: Block) -> Result<kernel::InductiveBlock, Failure> {
         let mut out = kernel::InductiveBlock {
             types: Vec::new(),
             constructors: Vec::new(),
@@ -401,8 +431,8 @@ impl<'a> Convert<'a> {
             match *d {
                 Declar::Ind(i) => out.types.push(kernel::InductiveType {
                     name: self.name(i.info.name),
-                    params: self.params(i.info.uparams),
-                    ty: (*self.expr(i.info.ty)).clone(),
+                    params: self.params(i.info.uparams)?,
+                    ty: (*self.expr(i.info.ty)?).clone(),
                     all: i.all.iter().map(|n| self.name(*n)).collect(),
                     constructors: i.ctors.iter().map(|n| self.name(*n)).collect(),
                     num_params: i.num_params.into(),
@@ -413,36 +443,42 @@ impl<'a> Convert<'a> {
                 }),
                 Declar::Ctor(c) => out.constructors.push(kernel::Constructor {
                     name: self.name(c.info.name),
-                    params: self.params(c.info.uparams),
-                    ty: (*self.expr(c.info.ty)).clone(),
+                    params: self.params(c.info.uparams)?,
+                    ty: (*self.expr(c.info.ty)?).clone(),
                     inductive: self.name(c.induct),
                     index: c.cidx.into(),
                     num_params: c.num_params.into(),
                     num_fields: c.num_fields.into(),
                 }),
-                Declar::Rec(r) => out.recursors.push(kernel::Recursor {
-                    name: self.name(r.info.name),
-                    params: self.params(r.info.uparams),
-                    ty: (*self.expr(r.info.ty)).clone(),
-                    all: r.all.iter().map(|n| self.name(*n)).collect(),
-                    num_params: r.num_params.into(),
-                    num_indices: r.num_indices.into(),
-                    num_motives: r.num_motives.into(),
-                    num_minors: r.num_minors.into(),
-                    k: r.is_k,
-                    rules: r
-                        .rules
-                        .iter()
-                        .map(|r| kernel::RecursorRule {
-                            constructor: self.name(r.ctor),
-                            num_fields: r.nfields.into(),
-                            rhs: (*self.expr(r.rhs)).clone(),
-                        })
-                        .collect(),
-                }),
+                Declar::Rec(r) => {
+                    let mut rules = Vec::with_capacity(r.rules.len());
+                    for rule in r.rules.iter() {
+                        rules.push(kernel::RecursorRule {
+                            constructor: self.name(rule.ctor),
+                            num_fields: rule.nfields.into(),
+                            rhs: (*self.expr(rule.rhs)?).clone(),
+                        });
+                    }
+                    out.recursors.push(kernel::Recursor {
+                        name: self.name(r.info.name),
+                        params: self.params(r.info.uparams)?,
+                        ty: (*self.expr(r.info.ty)?).clone(),
+                        all: r.all.iter().map(|n| self.name(*n)).collect(),
+                        num_params: r.num_params.into(),
+                        num_indices: r.num_indices.into(),
+                        num_motives: r.num_motives.into(),
+                        num_minors: r.num_minors.into(),
+                        k: r.is_k,
+                        rules,
+                    });
+                }
                 _ => unreachable!("non-inductive block member"),
             }
         }
-        out
+        Ok(out)
     }
+}
+
+fn rejected(message: &str) -> Failure {
+    Failure::Rejected(message.to_owned())
 }
