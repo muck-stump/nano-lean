@@ -25,6 +25,7 @@
 - Return value checker rejections and declines through `R` instead of unwinding.
 - Return reference checker rejections and declines through `R` and drop the panic channel.
 - Pin function alignment to 64 bytes so code placement cannot move the hot loops.
+- Split the Mathlib CI script into a bounded shell driver and two Python helpers.
 
 ## 0.1.0 (2026-10-08)
 

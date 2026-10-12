@@ -42,13 +42,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Build release checker
         run: cargo build --release --locked --bin nl-fast
-      - name: Install instruction counter tooling
-        continue-on-error: true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y linux-tools-generic
-          # Permit user and kernel instruction counts where supported.
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
       - uses: actions/cache/restore@v4
         id: export
         with:
@@ -143,7 +136,6 @@ jobs:
             echo "Export coverage must match the $DECLARATIONS pinned declaration names."
             echo '```text'
             cat .ci/mathlib-report/export-time.txt 2>/dev/null || true
-            cat .ci/mathlib-report/perf-status.txt 2>/dev/null || true
             cat .ci/mathlib-report/summary.txt 2>/dev/null || true
             tail -n 3 .ci/mathlib-report/trace.log 2>/dev/null || true
             echo '```'
