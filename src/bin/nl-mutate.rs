@@ -85,11 +85,16 @@ fn main() -> ExitCode {
             println!("{op}: {why} ({})\n{verdicts}", m.site());
             if let Some(dir) = &o.out {
                 let wanted = mutate::signature(&verdicts);
-                let small = mutate::shrink(mutant, m.pin(), |c| {
-                    let v = mutate::check(c, limits);
-                    mutate::finding(m.expect, &baseline, &v).is_some()
-                        && mutate::signature(&v) == wanted
+                let valid = mutate::signature(&baseline);
+                let (base, pins) = mutate::shrink(lines.clone(), m.pins(), |c, pins| {
+                    let b = mutate::check(c, limits);
+                    mutate::signature(&b) == valid && {
+                        let v = mutate::check(&m.at(pins).apply(c), limits);
+                        mutate::finding(m.expect, &b, &v) == Some(why)
+                            && mutate::signature(&v) == wanted
+                    }
                 });
+                let small = m.at(&pins).apply(&base);
                 let file = dir.join(format!("{stem}-{op}-{findings}.ndjson"));
                 if let Err(e) =
                     fs::create_dir_all(dir).and_then(|()| fs::write(&file, mutate::render(&small)))

@@ -5,10 +5,10 @@ use super::expr::{Expr, HAS_LOCAL, Meta, mk};
 use super::level::Level;
 use super::name::{NUM_HASH, Name, NameNode, NatRed, STR_HASH, StrNode};
 use super::names::{
-    BOOL_FALSE, BOOL_TRUE, CHAR, CHAR_OF_NAT, EQ, LIST_CONS, LIST_NIL, NAT, NAT_ADD, NAT_BEQ,
-    NAT_BLE, NAT_DIV, NAT_GCD, NAT_LAND, NAT_LOG2, NAT_LOR, NAT_MOD, NAT_MUL, NAT_POW, NAT_SHL,
-    NAT_SHR, NAT_SUB, NAT_SUCC, NAT_XOR, NAT_ZERO, QUOT, QUOT_IND, QUOT_LIFT, QUOT_MK, STRING,
-    STRING_OF_LIST,
+    BOOL, BOOL_FALSE, BOOL_TRUE, CHAR, CHAR_OF_NAT, EQ, LIST, LIST_CONS, LIST_NIL, NAT, NAT_ADD,
+    NAT_BEQ, NAT_BLE, NAT_DIV, NAT_GCD, NAT_LAND, NAT_LOG2, NAT_LOR, NAT_MOD, NAT_MUL, NAT_POW,
+    NAT_SHL, NAT_SHR, NAT_SUB, NAT_SUCC, NAT_XOR, NAT_ZERO, QUOT, QUOT_IND, QUOT_LIFT, QUOT_MK,
+    STRING, STRING_OF_LIST,
 };
 use super::ptr::{BigUintPtr, ExprPtr, LevelPtr, LevelsPtr, NamePtr, StringPtr};
 use crate::hash64;
@@ -312,10 +312,12 @@ names! {
     string_of_list = STRING_OF_LIST,
     char = CHAR,
     char_of_nat = CHAR_OF_NAT,
+    list = LIST,
     list_nil = LIST_NIL,
     list_cons = LIST_CONS,
     nat = NAT,
     nat_zero = NAT_ZERO,
+    bool = BOOL,
     bool_true = BOOL_TRUE,
     bool_false = BOOL_FALSE,
     nat_succ = NAT_SUCC => Succ,

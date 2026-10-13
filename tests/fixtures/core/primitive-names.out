@@ -1,0 +1,13 @@
+axiom Nat
+axiom Nat.zero
+axiom Nat.succ
+axiom Bool
+axiom Nat.beq
+axiom List
+axiom List.nil
+error: reserved primitive name: Nat.add
+error: reserved primitive name: Nat.ble
+error: reserved primitive name: String
+error: reserved primitive name: List.cons
+error: reserved primitive name: Nat.mul
+checked (@Nat.succ @Nat.zero) : @Nat

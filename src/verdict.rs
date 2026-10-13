@@ -115,40 +115,86 @@ impl Core {
     }
 }
 
-fn fast(source: &str, limits: Limits, core: Core) -> Verdict {
+fn deep<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    thread::scope(|s| {
+        thread::Builder::new()
+            .stack_size(STACK_BYTES)
+            .spawn_scoped(s, f)
+            .expect("spawn checker thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+/// Checks declarations in order until `visit` returns false. With `persist` the session
+/// keeps its caches across accepted declarations as `nl-fast` does, otherwise it resets
+/// after every one.
+fn walk(
+    source: &str,
+    limits: Limits,
+    core: Core,
+    persist: bool,
+    mut visit: impl FnMut(Verdict) -> bool,
+) {
     let arena = Arena::new();
     let store = match import::import_reader(&arena, source.as_bytes(), source.len()) {
         Ok(store) => store,
-        Err(ExportError::Invalid(s)) => return Verdict::Rejected(s),
-        Err(ExportError::Unsupported(s)) => return Verdict::Unsupported(s),
+        Err(ExportError::Invalid(s)) => {
+            visit(Verdict::Rejected(s));
+            return;
+        }
+        Err(ExportError::Unsupported(s)) => {
+            visit(Verdict::Unsupported(s));
+            return;
+        }
     };
     let mut session = Session::new(&store);
     let mut adapter = Adapter::new(&store);
     for idx in 0..store.declars.len() as u32 {
         let r = core.check(&store, &mut session, idx, limits, &mut adapter, true);
-        session.reset();
-        if let Err(f) = r {
-            let name = store.declars[idx as usize].name().to_string();
-            return match Verdict::from(f) {
-                Verdict::Rejected(s) => Verdict::Rejected(format!("{name}: {s}")),
-                v => v,
-            };
+        if !persist || r.is_err() {
+            session.reset();
+        }
+        let verdict = match r.map_err(Verdict::from) {
+            Ok(_) => Verdict::Accepted,
+            Err(Verdict::Rejected(s)) => {
+                Verdict::Rejected(format!("{}: {s}", store.declars[idx as usize].name()))
+            }
+            Err(v) => v,
+        };
+        if !visit(verdict) {
+            return;
         }
     }
-    Verdict::Accepted
+}
+
+fn fast(source: &str, limits: Limits, core: Core) -> Verdict {
+    let mut last = Verdict::Accepted;
+    walk(source, limits, core, false, |v| {
+        let go = v.accepted();
+        last = v;
+        go
+    });
+    last
+}
+
+/// The verdict of every declaration in turn, continuing past failures so the session is
+/// also exercised after a rejection.
+pub fn each(source: &str, limits: Limits, core: Core, persist: bool) -> Vec<Verdict> {
+    deep(|| {
+        let mut out = Vec::new();
+        walk(source, limits, core, persist, |v| {
+            out.push(v);
+            true
+        });
+        out
+    })
 }
 
 pub fn check(source: &str, limits: Limits) -> Verdicts {
-    thread::scope(|s| {
-        thread::Builder::new()
-            .stack_size(STACK_BYTES)
-            .spawn_scoped(s, || Verdicts {
-                reference: reference(source),
-                fast: fast(source, limits, Core::Term),
-                value: fast(source, limits, Core::Value),
-            })
-            .expect("spawn checker thread")
-            .join()
-            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    deep(|| Verdicts {
+        reference: reference(source),
+        fast: fast(source, limits, Core::Term),
+        value: fast(source, limits, Core::Value),
     })
 }

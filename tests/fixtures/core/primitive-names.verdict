@@ -1,0 +1,3 @@
+reference: rejected: line 35: reserved primitive name: ["Nat","add"]
+fast: rejected: reserved primitive name Nat.add
+value: rejected: reserved primitive name Nat.add

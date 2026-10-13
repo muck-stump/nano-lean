@@ -1,7 +1,7 @@
 pub use crate::schema::Ref;
 use crate::schema::{ExprKind, META};
-use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use serde_json::Value;
+use std::collections::BTreeSet;
 
 pub fn defines(entry: &Value) -> Option<(Ref, u64)> {
     Ref::ALL
@@ -89,11 +89,13 @@ pub fn refs(entry: &Value) -> Vec<(Ref, String)> {
     out
 }
 
-pub fn compact(lines: &[Value], pin: Option<usize>) -> (Vec<Value>, Option<usize>) {
+/// Drops definitions nothing reachable from a declaration or a pin uses, keeping ids as
+/// they are so an edit re-applied at the returned pins means exactly what it meant before.
+pub fn compact(lines: &[Value], pins: &[usize]) -> (Vec<Value>, Vec<usize>) {
     let mut live: BTreeSet<(Ref, u64)> = BTreeSet::new();
     for (i, line) in lines.iter().enumerate().rev() {
         let keep = match defines(line) {
-            Some(d) => pin == Some(i) || live.contains(&d),
+            Some(d) => pins.contains(&i) || live.contains(&d),
             None => true,
         };
         if keep {
@@ -102,32 +104,18 @@ pub fn compact(lines: &[Value], pin: Option<usize>) -> (Vec<Value>, Option<usize
             }
         }
     }
-    let mut map: BTreeMap<(Ref, u64), u64> = [((Ref::Name, 0), 0), ((Ref::Level, 0), 0)].into();
-    let mut next = BTreeMap::from([(Ref::Name, 1), (Ref::Level, 1), (Ref::Expr, 0)]);
-    let (mut out, mut moved) = (Vec::new(), None);
+    let mut seen = BTreeSet::new();
+    let (mut out, mut at) = (Vec::new(), vec![usize::MAX; lines.len()]);
     for (i, line) in lines.iter().enumerate() {
-        let mut line = line.clone();
-        if let Some((kind, id)) = defines(&line) {
-            let pinned = pin == Some(i);
-            if !pinned && (!live.contains(&(kind, id)) || map.contains_key(&(kind, id))) {
-                continue;
-            }
-            let counter = next.entry(kind).or_default();
-            let fresh = *counter;
-            *counter += 1;
-            map.entry((kind, id)).or_insert(fresh);
-            line[kind.key()] = json!(fresh);
+        let pinned = pins.contains(&i);
+        if let Some(d) = defines(line)
+            && !pinned
+            && (!live.contains(&d) || !seen.insert(d))
+        {
+            continue;
         }
-        for (kind, ptr) in refs(&line) {
-            let slot = line.pointer_mut(&ptr).expect("refs point at ids");
-            if let Some(&n) = map.get(&(kind, slot.as_u64().expect("refs point at ids"))) {
-                *slot = json!(n);
-            }
-        }
-        if pin == Some(i) {
-            moved = Some(out.len());
-        }
-        out.push(line);
+        at[i] = out.len();
+        out.push(line.clone());
     }
-    (out, moved)
+    (out, pins.iter().map(|&p| at[p]).collect())
 }

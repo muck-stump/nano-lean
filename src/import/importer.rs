@@ -376,7 +376,7 @@ impl<'a> Importer<'a> {
                 return invalid(format!("reserved quotient name {n}"));
             }
         }
-        Ok(Store {
+        let store = Store {
             dag: self.dag,
             anon: self.anon,
             zero: self.zero,
@@ -384,7 +384,9 @@ impl<'a> Importer<'a> {
             blocks: self.blocks,
             names,
             stats: self.stats,
-        })
+        };
+        super::primitives::check(&store)?;
+        Ok(store)
     }
 }
 

@@ -316,6 +316,19 @@ impl Environment {
                 .chain(actual.constructors.iter().map(|c| &c.name))
                 .chain(actual.recursors.iter().map(|r| &r.name)),
         )?;
+        for (name, params, ty) in actual
+            .types
+            .iter()
+            .map(|t| (&t.name, &t.params, &t.ty))
+            .chain(
+                actual
+                    .constructors
+                    .iter()
+                    .map(|c| (&c.name, &c.params, &c.ty)),
+            )
+        {
+            super::primitive::validate(name, params, ty)?;
+        }
         let expansion = NestedExpansion::new(self, actual)?;
         if expansion.is_nested() {
             // Check before specialization: an unused container parameter must not erase an ill-typed argument.

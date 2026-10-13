@@ -597,19 +597,19 @@ mod tests {
         let list = complete(
             &mut env,
             &spec(
-                "List",
+                "Seq",
                 "Type -> Type",
                 1,
                 &[
-                    ("nil", "forall (A : Type), List A", 0),
-                    ("cons", "forall (A : Type), A -> List A -> List A", 2),
+                    ("nil", "forall (A : Type), Seq A", 0),
+                    ("cons", "forall (A : Type), A -> Seq A -> Seq A", 2),
                 ],
             ),
         );
         env.declare_inductive(&list).unwrap();
         let rose = complete(
             &mut env,
-            &spec("Rose", "Type", 0, &[("node", "List Rose -> Rose", 1)]),
+            &spec("Rose", "Type", 0, &[("node", "Seq Rose -> Rose", 1)]),
         );
         let original_names: Vec<_> = env.declarations.keys().cloned().collect();
         let mut forged = rose.clone();

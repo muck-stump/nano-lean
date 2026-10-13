@@ -51,11 +51,28 @@ impl Mutant {
         out
     }
 
-    pub fn pin(&self) -> Option<usize> {
+    /// Lines the edit touches, which shrinking must keep.
+    pub fn pins(&self) -> Vec<usize> {
         match self.edit {
-            Edit::Set(i, ..) | Edit::Replace(i, _) => Some(i),
-            Edit::Duplicate(i) => Some(i + 1),
-            Edit::Remove(_) | Edit::Swap(..) => None,
+            Edit::Set(i, ..) | Edit::Replace(i, _) | Edit::Remove(i) | Edit::Duplicate(i) => {
+                vec![i]
+            }
+            Edit::Swap(a, b) => vec![a, b],
+        }
+    }
+
+    /// The same edit aimed at the lines `pins` moved to.
+    pub fn at(&self, pins: &[usize]) -> Self {
+        let edit = match &self.edit {
+            Edit::Set(_, ptr, v) => Edit::Set(pins[0], ptr.clone(), v.clone()),
+            Edit::Replace(_, v) => Edit::Replace(pins[0], v.clone()),
+            Edit::Remove(_) => Edit::Remove(pins[0]),
+            Edit::Duplicate(_) => Edit::Duplicate(pins[0]),
+            Edit::Swap(..) => Edit::Swap(pins[0], pins[1]),
+        };
+        Self {
+            edit,
+            ..self.clone()
         }
     }
 
@@ -140,30 +157,33 @@ pub fn finding(expect: Expect, baseline: &Verdicts, v: &Verdicts) -> Option<&'st
     }
 }
 
+/// Removes declarations and dead definitions while `keep` holds, returning the survivors and
+/// where the pinned lines ended up.
 pub fn shrink(
     mut lines: Vec<Value>,
-    mut pin: Option<usize>,
-    keep: impl Fn(&[Value]) -> bool,
-) -> Vec<Value> {
+    mut pins: Vec<usize>,
+    keep: impl Fn(&[Value], &[usize]) -> bool,
+) -> (Vec<Value>, Vec<usize>) {
     loop {
         let before = lines.len();
         for i in (0..lines.len()).rev() {
-            if is_declaration(&lines[i]) && pin != Some(i) {
+            if is_declaration(&lines[i]) && !pins.contains(&i) {
                 let mut candidate = lines.clone();
                 candidate.remove(i);
-                if keep(&candidate) {
+                let moved: Vec<_> = pins.iter().map(|&p| p - usize::from(p > i)).collect();
+                if keep(&candidate, &moved) {
                     lines = candidate;
-                    pin = pin.map(|p| if p > i { p - 1 } else { p });
+                    pins = moved;
                 }
             }
         }
-        let (compacted, moved) = compact(&lines, pin);
-        if compacted.len() < lines.len() && keep(&compacted) {
+        let (compacted, moved) = compact(&lines, &pins);
+        if compacted.len() < lines.len() && keep(&compacted, &moved) {
             lines = compacted;
-            pin = moved;
+            pins = moved;
         }
         if lines.len() == before {
-            return lines;
+            return (lines, pins);
         }
     }
 }

@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use nano_lean::{checker::Limits, emit, parser, verdict};
+use nano_lean::{checker::Limits, emit, parser, verdict, verdict::Core};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -70,6 +70,28 @@ fn every_rejection_is_shared() {
             }
             if !verdicts.reference.accepted() {
                 accepted.pop();
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn persistent_sessions_match_fresh_ones() {
+    let mut failed = Vec::new();
+    let paths = sources("tests/fixtures", "ndjson")
+        .into_iter()
+        .chain(sources("tests/fixtures/core", "ltc"));
+    for path in paths {
+        let source = export(&path);
+        for core in [Core::Term, Core::Value] {
+            let fresh = verdict::each(&source, Limits::default(), core, false);
+            let kept = verdict::each(&source, Limits::default(), core, true);
+            if fresh != kept {
+                failed.push(format!(
+                    "{} {core:?}\nfresh: {fresh:?}\nkept: {kept:?}",
+                    path.display()
+                ));
             }
         }
     }

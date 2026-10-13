@@ -1,0 +1,15 @@
+-- Primitive names must carry the signatures the reductions assume.
+axiom Nat : Type
+axiom Nat.zero : Nat
+axiom Nat.succ : Nat -> Nat
+axiom Bool : Type
+axiom Nat.beq : Nat -> Nat -> Bool
+axiom List.{u} : Sort (u+1) -> Sort (u+1)
+axiom List.nil.{u} : forall (A : Sort (u+1)), List.{u} A
+axiom Nat.add : Nat -> Nat
+axiom Nat.ble : Nat -> Nat -> Nat
+axiom String : Prop
+axiom List.cons : forall (A : Type), A -> List.{0} A -> List.{0} A
+inductive Nat.mul : Type
+  | Nat.mul.mk : Nat.mul
+check Nat.succ Nat.zero : Nat

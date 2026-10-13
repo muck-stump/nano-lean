@@ -85,6 +85,7 @@ impl Environment {
         if quotient::reserved(&name) {
             return Err(Error::Rejected(format!("reserved quotient name: {name}")));
         }
+        primitive::validate(&name, &params, &ty)?;
         self.declare_unreserved(name, params, ty, value, transparent)
     }
     fn declare_unreserved(

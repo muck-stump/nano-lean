@@ -44,7 +44,7 @@ fn compaction_preserves_verdicts() {
         "foundations.ndjson",
     ] {
         let lines = fixture(name);
-        let (compact, _) = mutate::compact(&lines, None);
+        let (compact, _) = mutate::compact(&lines, &[]);
         assert_eq!(
             mutate::check(&compact, Limits::default()).to_string(),
             mutate::check(&lines, Limits::default()).to_string(),
@@ -73,13 +73,28 @@ fn last_name(lines: &[serde_json::Value]) -> String {
 }
 
 #[test]
-fn shrinking_keeps_the_pinned_declaration_and_its_cone() {
+fn shrinking_keeps_the_edit_and_a_valid_base() {
     let lines = fixture("primitives.ndjson");
     let pin = lines.iter().rposition(mutate::is_declaration).unwrap();
-    let small = mutate::shrink(lines.clone(), Some(pin), |c| {
-        mutate::check(c, Limits::default()).reference.accepted()
+    let m = mutate::mutants(&lines, Operator::DuplicateDecl)
+        .into_iter()
+        .find(|m| m.pins() == [pin])
+        .unwrap();
+    let wanted = mutate::signature(&mutate::check(&m.apply(&lines), Limits::default()));
+    assert_eq!(wanted, "RRR");
+    let (base, pins) = mutate::shrink(lines.clone(), m.pins(), |c, pins| {
+        mutate::signature(&mutate::check(c, Limits::default())) == "AAA"
+            && mutate::signature(&mutate::check(&m.at(pins).apply(c), Limits::default())) == wanted
     });
-    assert!(small.len() < lines.len());
-    assert_eq!(last_name(&small), last_name(&lines));
-    assert!(mutate::check(&small, Limits::default()).agree());
+    assert!(base.len() < lines.len());
+    assert_eq!(last_name(&base), last_name(&lines));
+    assert_eq!(
+        mutate::signature(&mutate::check(&base, Limits::default())),
+        "AAA"
+    );
+    let witness = m.at(&pins).apply(&base);
+    assert_eq!(
+        mutate::signature(&mutate::check(&witness, Limits::default())),
+        wanted
+    );
 }

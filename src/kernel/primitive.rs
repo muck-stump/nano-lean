@@ -2,8 +2,9 @@ use super::inductive::spine;
 use super::prelude::*;
 use super::{Expr, Level};
 use crate::term::names::{
-    BOOL_FALSE, BOOL_TRUE, CHAR, CHAR_OF_NAT, LIST_CONS, LIST_NIL, NAT_SUCC, NAT_ZERO,
-    STRING_OF_LIST,
+    BOOL, BOOL_FALSE, BOOL_TRUE, CHAR, CHAR_OF_NAT, LIST, LIST_CONS, LIST_NIL, NAT, NAT_ADD,
+    NAT_BEQ, NAT_BLE, NAT_DIV, NAT_GCD, NAT_LAND, NAT_LOG2, NAT_LOR, NAT_MOD, NAT_MUL, NAT_POW,
+    NAT_SHL, NAT_SHR, NAT_SUB, NAT_SUCC, NAT_XOR, NAT_ZERO, STRING, STRING_OF_LIST,
 };
 use num_bigint::BigUint;
 use num_integer::Integer;
@@ -19,6 +20,78 @@ pub(super) fn symbol(path: &str, encoded: bool) -> String {
             .expect("serializing strings cannot fail")
     } else {
         path.into()
+    }
+}
+
+const RESERVED: [(&str, usize); 28] = [
+    (NAT, 0),
+    (NAT_ZERO, 0),
+    (NAT_SUCC, 0),
+    (NAT_LOG2, 0),
+    (NAT_ADD, 0),
+    (NAT_SUB, 0),
+    (NAT_MUL, 0),
+    (NAT_POW, 0),
+    (NAT_MOD, 0),
+    (NAT_DIV, 0),
+    (NAT_GCD, 0),
+    (NAT_LAND, 0),
+    (NAT_LOR, 0),
+    (NAT_XOR, 0),
+    (NAT_SHL, 0),
+    (NAT_SHR, 0),
+    (NAT_BEQ, 0),
+    (NAT_BLE, 0),
+    (BOOL, 0),
+    (BOOL_TRUE, 0),
+    (BOOL_FALSE, 0),
+    (CHAR, 0),
+    (CHAR_OF_NAT, 0),
+    (STRING, 0),
+    (STRING_OF_LIST, 0),
+    (LIST, 1),
+    (LIST_NIL, 1),
+    (LIST_CONS, 1),
+];
+
+fn signature(name: &str, params: &[String], encoded: bool) -> Expr {
+    let c = |s: &str| Expr::Const(symbol(s, encoded), vec![]);
+    let arrow = |a: Expr, b: Expr| Expr::pi(Name::new("_"), a, b);
+    let ty = || Expr::Sort(Level::Nat(1));
+    let u = || Level::Param(params[0].clone());
+    let list = |l: Level, a: Expr| Expr::Const(symbol(LIST, encoded), vec![l]).app(a);
+    let a = Name::new("A");
+    let av = || Expr::Var(a.clone());
+    let elem = || Expr::Sort(Level::Succ(Box::new(u())));
+    match name {
+        NAT | BOOL | CHAR | STRING => ty(),
+        NAT_ZERO => c(NAT),
+        NAT_SUCC | NAT_LOG2 => arrow(c(NAT), c(NAT)),
+        NAT_BEQ | NAT_BLE => arrow(c(NAT), arrow(c(NAT), c(BOOL))),
+        BOOL_TRUE | BOOL_FALSE => c(BOOL),
+        CHAR_OF_NAT => arrow(c(NAT), c(CHAR)),
+        STRING_OF_LIST => arrow(list(Level::Nat(0), c(CHAR)), c(STRING)),
+        LIST => arrow(elem(), elem()),
+        LIST_NIL => Expr::pi(a.clone(), elem(), list(u(), av())),
+        LIST_CONS => Expr::pi(
+            a.clone(),
+            elem(),
+            arrow(av(), arrow(list(u(), av()), list(u(), av()))),
+        ),
+        _ => arrow(c(NAT), arrow(c(NAT), c(NAT))),
+    }
+}
+
+/// Rejects a declaration that reuses a primitive name with a different signature.
+pub(super) fn validate(name: &str, params: &[String], ty: &Expr) -> Result<()> {
+    let encoded = name.starts_with('[');
+    let Some(&(prim, arity)) = RESERVED.iter().find(|(p, _)| name == symbol(p, encoded)) else {
+        return Ok(());
+    };
+    if params.len() == arity && ty.aeq(&signature(prim, params, encoded)) {
+        Ok(())
+    } else {
+        Err(Error::Rejected(format!("reserved primitive name: {name}")))
     }
 }
 

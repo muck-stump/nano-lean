@@ -159,7 +159,8 @@ fn literals_require_declared_well_formed_types() {
     assert!(env.infer(&Expr::nat(0u32)).is_err());
     assert!(env.infer(&Expr::Str("x".into())).is_err());
     let mut env = Environment::new();
-    env.axiom("Nat", expr("Prop")).unwrap();
+    assert!(env.axiom("Nat", expr("Prop")).is_err());
+    assert!(env.axiom("Nat.add", expr("Type")).is_err());
     assert!(env.infer(&Expr::nat(0u32)).is_err());
 }
 
