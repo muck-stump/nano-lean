@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Charge the value core argument probe per step instead of per comparison, so a probe on a big structure stays bounded.
 - Split the Mathlib CI script into shell and Python files and drop the perf probe.
 - Gate quotient reduction on `Quot` declarations.
 - Reject quotient names on other declarations.

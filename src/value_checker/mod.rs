@@ -49,7 +49,8 @@ struct Vc<'t, 'a: 't> {
     limit: u32,
     limits: Limits,
     steps_left: u64,
-    probe_remaining: Option<u32>,
+    /// The suspended outer step budget while an argument probe runs on its own.
+    probe_outer: Option<u64>,
     next_local: u32,
     depth: usize,
     /// Bumped whenever a check depends on the universe parameters in scope.
@@ -90,7 +91,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
             limit: 0,
             limits,
             steps_left: limits.steps,
-            probe_remaining: None,
+            probe_outer: None,
             next_local: 0,
             depth: 0,
             scoped: 0,
@@ -163,7 +164,10 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
     #[inline(never)]
     fn tick_slow(&mut self) -> R<()> {
         if self.steps_left == 0 {
-            return Err(self.decline(Budget::Work));
+            return Err(match self.probe_outer {
+                Some(_) => Stop,
+                None => self.decline(Budget::Work),
+            });
         }
         self.steps_left -= 1;
         if self.steps_left & ARENA_STRIDE_MASK == 0 {

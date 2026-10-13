@@ -10,7 +10,7 @@ use std::ptr;
 use std::rc::Rc;
 
 /// Steps a same-head argument probe takes before both sides unfold instead.
-const PROBE_BUDGET: u32 = 2048;
+const PROBE_BUDGET: u64 = 32768;
 
 const SAME_FUEL: u32 = 512;
 
@@ -36,12 +36,6 @@ fn identical_clo(a: Clo<'_>, b: Clo<'_>) -> bool {
 impl<'t, 'a: 't> Vc<'t, 'a> {
     pub(crate) fn def_eq(&mut self, t: V<'t>, s: V<'t>) -> R<bool> {
         self.tick()?;
-        if let Some(r) = &mut self.probe_remaining {
-            if *r == 0 {
-                return Err(Stop);
-            }
-            *r -= 1;
-        }
         stat!(self, deq_calls);
         if ptr::eq(t, s) || self.t.eq_cache.contains(&(key(t), key(s))) {
             stat!(self, deq_ptr_eq);
@@ -328,17 +322,22 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         if self.t.fail_cache.contains(&(key(t), key(s))) {
             return Ok(false);
         }
-        if self.probe_remaining.is_some() {
+        if self.probe_outer.is_some() {
             return self.args_eq(t, s);
         }
         stat!(self, probes);
-        self.probe_remaining = Some(PROBE_BUDGET);
+        let outer = self.steps_left;
+        let budget = outer.min(PROBE_BUDGET);
+        self.steps_left = budget;
+        self.probe_outer = Some(outer);
         let r = self.args_eq(t, s);
+        let used = budget - self.steps_left;
         #[cfg(feature = "vstats")]
         {
-            self.stats.probe_ticks += u64::from(PROBE_BUDGET - self.probe_remaining.unwrap_or(0));
+            self.stats.probe_ticks += used;
         }
-        self.probe_remaining = None;
+        self.steps_left = outer - used;
+        self.probe_outer = None;
         if r.is_err() {
             if self.fail.is_some() {
                 return Err(Stop);
