@@ -83,8 +83,8 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     && match (h, g) {
                         (Head::Local(i, _), Head::Local(j, _)) => i == j,
                         (Head::Const(m, ls), Head::Const(n, ks)) => m == n && ls == ks,
-                        (Head::Proj(_, i, x), Head::Proj(_, j, y)) => {
-                            i == j && self.same(x, y, fuel)
+                        (Head::Proj(m, i, x), Head::Proj(n, j, y)) => {
+                            m == n && i == j && self.same(x, y, fuel)
                         }
                         _ => false,
                     }
@@ -248,8 +248,8 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
                     return Ok(true);
                 }
             }
-            (K::Neu(Head::Proj(_, i, x), []), K::Neu(Head::Proj(_, j, y), []))
-                if i == j && self.def_eq(x, y)? =>
+            (K::Neu(Head::Proj(m, i, x), []), K::Neu(Head::Proj(n, j, y), []))
+                if m == n && i == j && self.def_eq(x, y)? =>
             {
                 return Ok(true);
             }
@@ -511,7 +511,7 @@ impl<'t, 'a: 't> Vc<'t, 'a> {
         Ok(match (a, b) {
             (Head::Local(x, _), Head::Local(y, _)) => x == y,
             (Head::Const(x, lx), Head::Const(y, ly)) => x == y && self.levels_eq(lx, ly)?,
-            (Head::Proj(_, i, x), Head::Proj(_, j, y)) => i == j && self.def_eq(x, y)?,
+            (Head::Proj(m, i, x), Head::Proj(n, j, y)) => m == n && i == j && self.def_eq(x, y)?,
             _ => false,
         })
     }

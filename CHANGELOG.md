@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Compare the structure name when two stuck projections meet in the fast cores, matching the reference kernel.
 - Charge the value core argument probe per step instead of per comparison, so a probe on a big structure stays bounded.
 - Compare persistent sessions with fresh ones across every fixture, past rejections.
 - Shrink findings on the unmutated export and re-apply the edit, so a witness keeps a valid base and its expected verdict.

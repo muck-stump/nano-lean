@@ -249,9 +249,20 @@ impl<'t, 'a: 't> Tc<'t, 'a> {
                     return Ok(true);
                 }
             }
-            (Expr::Proj { idx: i, e: x, .. }, Expr::Proj { idx: j, e: y, .. })
-                if i == j && self.def_eq(x, y)? =>
-            {
+            (
+                Expr::Proj {
+                    name: m,
+                    idx: i,
+                    e: x,
+                    ..
+                },
+                Expr::Proj {
+                    name: n,
+                    idx: j,
+                    e: y,
+                    ..
+                },
+            ) if m == n && i == j && self.def_eq(x, y)? => {
                 return Ok(true);
             }
             _ => {}
